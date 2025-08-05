@@ -69,7 +69,7 @@ def track():
 
 # === BOOT SERVER ===
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8009))  # Use env var, fallback to 8009
+    port = int(os.getenv("PORT", 8010))
     host = os.getenv("HOST", "0.0.0.0")
     banner("🚀 Starting Tracking Server")
     print(f"Listening on \033[93mhttp://{host}:{port}/track\033[0m for tracking pixels...\n")
