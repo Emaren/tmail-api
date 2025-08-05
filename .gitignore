@@ -1,0 +1,4 @@
+.envrc
+.direnv/
+.python-version
+venv-logs/
