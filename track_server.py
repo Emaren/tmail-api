@@ -3,9 +3,16 @@
 import os
 import time
 from flask import Flask, request, send_file, make_response
+from flask_cors import CORS  # ✅ NEW
 from urllib.parse import unquote_plus
+from routes import stats
 
 app = Flask(__name__)
+CORS(app)  # ✅ Enable CORS globally
+app.register_blueprint(stats.bp, url_prefix="/api")
+
+# === GLOBAL LOG FILE PATH (absolute) ===
+LOG_PATH = "/var/www/tmail-api/open_log.txt"
 
 # === COLORIZED LOGGING ===
 def log(label, value, icon="🔍"):
@@ -24,7 +31,7 @@ def log_request():
     path   = request.path
     remote = request.remote_addr
 
-    banner("Incoming Pixel Request")
+    banner("Incoming Request")
     log("From IP", remote, "🌐")
     log("Method", method)
     log("Path", path)
@@ -52,10 +59,9 @@ def track():
         log("Query Timestamp", ts)
 
     # Save to open_log.txt
-    log_path = os.path.join(os.path.dirname(__file__), "open_log.txt")
-    with open(log_path, "a") as f:
+    with open(LOG_PATH, "a") as f:
         f.write(entry + "\n")
-    log("Logged Entry", log_path, "📝")
+    log("Logged Entry", LOG_PATH, "📝")
 
     # Serve tracking GIF
     gif_path = os.path.join(os.path.dirname(__file__), "pixel.gif")
