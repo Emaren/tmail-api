@@ -1,0 +1,1 @@
+/Users/tonyblum/projects/llama-scripts/inject-envrc-path.sh
