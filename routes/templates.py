@@ -26,3 +26,11 @@ def get_template(template_id: str):
     if not template:
         return jsonify({"error": "Template not found"}), 404
     return jsonify(template)
+
+
+@bp.route("/templates/<template_id>/versions", methods=["GET"])
+def list_template_versions(template_id: str):
+    template = repo.get(template_id)
+    if not template:
+        return jsonify({"error": "Template not found"}), 404
+    return jsonify({"items": repo.list_versions(template_id)})

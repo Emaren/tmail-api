@@ -306,12 +306,12 @@ class TemplateRepository:
     def list(self) -> list[dict[str, Any]]:
         with get_connection() as conn:
             rows = conn.execute("SELECT * FROM templates ORDER BY updated_at DESC, name ASC").fetchall()
-        return [self._row_to_dict(row) for row in rows]
+            return [self._row_to_dict(row, conn=conn) for row in rows]
 
     def get(self, template_id: str) -> dict[str, Any] | None:
         with get_connection() as conn:
             row = conn.execute("SELECT * FROM templates WHERE id = ?", (template_id,)).fetchone()
-        return self._row_to_dict(row) if row else None
+            return self._row_to_dict(row, conn=conn) if row else None
 
     def save(self, payload: dict[str, Any]) -> dict[str, Any]:
         missing = [field for field in ("name", "subject", "html_body", "text_body") if not str(payload.get(field, "")).strip()]
@@ -364,7 +364,21 @@ class TemplateRepository:
                 """,
                 row,
             )
+            self._snapshot_version_if_changed(conn, row)
         return self.get(template_id)  # type: ignore[return-value]
+
+    def list_versions(self, template_id: str, limit: int = 12) -> list[dict[str, Any]]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM template_versions
+                WHERE template_id = ?
+                ORDER BY version_number DESC, created_at DESC
+                LIMIT ?
+                """,
+                (template_id, limit),
+            ).fetchall()
+        return [self._version_to_dict(row) for row in rows]
 
     def _unique_slug(self, conn: sqlite3.Connection, desired_slug: str, template_id: str) -> str:
         base_slug = desired_slug.strip() or make_id("tpl")
@@ -378,7 +392,81 @@ class TemplateRepository:
             candidate = f"{base_slug}-{suffix}"
             suffix += 1
 
-    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _snapshot_version_if_changed(self, conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+        latest = conn.execute(
+            """
+            SELECT * FROM template_versions
+            WHERE template_id = ?
+            ORDER BY version_number DESC
+            LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+
+        if latest and self._version_matches_row(latest, row):
+            return
+
+        next_version = (latest["version_number"] if latest else 0) + 1
+        conn.execute(
+            """
+            INSERT INTO template_versions (
+                id, template_id, version_number, name, category, description,
+                subject, preheader, html_body, text_body, is_active, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                make_id("tplver"),
+                row["id"],
+                next_version,
+                row["name"],
+                row["category"],
+                row["description"],
+                row["subject"],
+                row["preheader"],
+                row["html_body"],
+                row["text_body"],
+                row["is_active"],
+                row["updated_at"],
+            ),
+        )
+
+    def _version_matches_row(self, version_row: sqlite3.Row, row: dict[str, Any]) -> bool:
+        return all(
+            [
+                version_row["name"] == row["name"],
+                version_row["category"] == row["category"],
+                (version_row["description"] or "") == row["description"],
+                version_row["subject"] == row["subject"],
+                (version_row["preheader"] or "") == row["preheader"],
+                version_row["html_body"] == row["html_body"],
+                version_row["text_body"] == row["text_body"],
+                bool(version_row["is_active"]) == bool(row["is_active"]),
+            ]
+        )
+
+    def _version_meta(self, conn: sqlite3.Connection, template_id: str) -> dict[str, Any]:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS version_count, MAX(version_number) AS current_version
+            FROM template_versions
+            WHERE template_id = ?
+            """,
+            (template_id,),
+        ).fetchone()
+        return {
+            "version_count": row["version_count"] if row else 0,
+            "current_version": row["current_version"] if row else 0,
+        }
+
+    def _row_to_dict(self, row: sqlite3.Row, *, conn: sqlite3.Connection) -> dict[str, Any]:
+        meta = self._version_meta(conn, row["id"])
+        return {
+            **dict(row),
+            "is_active": bool(row["is_active"]),
+            **meta,
+        }
+
+    def _version_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             **dict(row),
             "is_active": bool(row["is_active"]),
@@ -602,8 +690,19 @@ class SeedTestRepository:
             "summary": row["summary"] or summary["summary_text"],
             "result_count": summary["result_count"],
             "completed_count": summary["completed_count"],
+            "accepted_count": summary["accepted_count"],
+            "rejected_count": summary["rejected_count"],
             "inbox_count": summary["inbox_count"],
+            "promotions_count": summary["promotions_count"],
             "spam_count": summary["spam_count"],
+            "missing_count": summary["missing_count"],
+            "clean_count": summary["clean_count"],
+            "issues_count": summary["issues_count"],
+            "acceptance_score": summary["acceptance_score"],
+            "placement_score": summary["placement_score"],
+            "render_score": summary["render_score"],
+            "overall_score": summary["overall_score"],
+            "score_state": summary["score_state"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "sent_at": row["sent_at"],
@@ -616,16 +715,61 @@ class SeedTestRepository:
         ).fetchall()
         result_count = len(rows)
         completed_count = len([row for row in rows if row["placement"] != "pending" or row["render_status"] != "pending" or row["accepted"] is not None])
+        accepted_count = len([row for row in rows if row["accepted"] == 1])
+        rejected_count = len([row for row in rows if row["accepted"] == 0])
         inbox_count = len([row for row in rows if row["placement"] == "inbox"])
+        promotions_count = len([row for row in rows if row["placement"] == "promotions"])
         spam_count = len([row for row in rows if row["placement"] == "spam"])
-        summary_text = f"{completed_count}/{result_count} seed results recorded. {inbox_count} inbox, {spam_count} spam."
+        missing_count = len([row for row in rows if row["placement"] == "missing"])
+        clean_count = len([row for row in rows if row["render_status"] == "clean"])
+        issues_count = len([row for row in rows if row["render_status"] == "issues"])
+
+        accepted_evaluated = accepted_count + rejected_count
+        acceptance_score = round((accepted_count / accepted_evaluated) * 100) if accepted_evaluated else 0
+
+        placement_values = {"inbox": 100, "promotions": 72, "spam": 12, "missing": 0}
+        placement_rows = [placement_values[row["placement"]] for row in rows if row["placement"] in placement_values]
+        placement_score = round(sum(placement_rows) / len(placement_rows)) if placement_rows else 0
+
+        render_values = {"clean": 100, "issues": 45}
+        render_rows = [render_values[row["render_status"]] for row in rows if row["render_status"] in render_values]
+        render_score = round(sum(render_rows) / len(render_rows)) if render_rows else 0
+
+        completion_ratio = (completed_count / result_count) if result_count else 0
+        weighted_score = (acceptance_score * 0.35) + (placement_score * 0.45) + (render_score * 0.20)
+        overall_score = round(weighted_score * completion_ratio)
+        score_state = self._score_state(overall_score, spam_count=spam_count, missing_count=missing_count, result_count=result_count)
+        summary_text = (
+            f"{completed_count}/{result_count} seed results recorded. "
+            f"Score {overall_score}. {inbox_count} inbox, {promotions_count} promotions, {spam_count} spam, {missing_count} missing."
+        )
         return {
             "result_count": result_count,
             "completed_count": completed_count,
+            "accepted_count": accepted_count,
+            "rejected_count": rejected_count,
             "inbox_count": inbox_count,
+            "promotions_count": promotions_count,
             "spam_count": spam_count,
+            "missing_count": missing_count,
+            "clean_count": clean_count,
+            "issues_count": issues_count,
+            "acceptance_score": acceptance_score,
+            "placement_score": placement_score,
+            "render_score": render_score,
+            "overall_score": overall_score,
+            "score_state": score_state,
             "summary_text": summary_text,
         }
+
+    def _score_state(self, overall_score: int, *, spam_count: int, missing_count: int, result_count: int) -> str:
+        if result_count == 0:
+            return "attention"
+        if spam_count > 0 or overall_score < 45:
+            return "critical"
+        if missing_count > 0 or overall_score < 75:
+            return "attention"
+        return "healthy"
 
     def _accepted_label(self, value: int | None) -> str:
         if value is None:

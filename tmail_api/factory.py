@@ -10,6 +10,7 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.register_blueprint(stats.bp, url_prefix="/api")
     app.register_blueprint(health.bp, url_prefix="/api")
+    app.register_blueprint(health.public_bp)
     app.register_blueprint(identities.bp, url_prefix="/api")
     app.register_blueprint(messages.bp, url_prefix="/api")
     app.register_blueprint(dashboard.bp, url_prefix="/api")

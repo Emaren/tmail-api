@@ -85,6 +85,22 @@ CREATE TABLE IF NOT EXISTS templates (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS template_versions (
+    id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT,
+    subject TEXT NOT NULL,
+    preheader TEXT,
+    html_body TEXT NOT NULL,
+    text_body TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(template_id) REFERENCES templates(id)
+);
+
 CREATE TABLE IF NOT EXISTS seed_inboxes (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
@@ -188,8 +204,8 @@ DEFAULT_TEMPLATES = [
         "description": "A minimal test message for seed inbox placement and render capture.",
         "subject": "TMail seed test probe",
         "preheader": "Seed inbox validation run from TMail.",
-        "html_body": "<html><body><p>This is a TMail seed test probe.</p><p><a href=\"https://api.tmail.tokentap.ca/api/health\">Check the API health endpoint</a></p></body></html>",
-        "text_body": "This is a TMail seed test probe.\n\nCheck the API health endpoint: https://api.tmail.tokentap.ca/api/health",
+        "html_body": "<html><body><p>This is a TMail seed test probe.</p><p><a href=\"https://api.tmail.tokentap.ca/healthz\">Check the public API health endpoint</a></p></body></html>",
+        "text_body": "This is a TMail seed test probe.\n\nCheck the public API health endpoint: https://api.tmail.tokentap.ca/healthz",
         "is_active": 1,
     },
 ]
@@ -263,6 +279,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         seed_default_identities(conn)
         seed_default_templates(conn)
+        seed_missing_template_versions(conn)
         seed_default_seed_inboxes(conn)
 
 
@@ -369,5 +386,39 @@ def seed_default_seed_inboxes(conn: sqlite3.Connection) -> None:
                 seed["enabled"],
                 now,
                 now,
+            ),
+        )
+
+
+def seed_missing_template_versions(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT * FROM templates ORDER BY created_at ASC").fetchall()
+    for row in rows:
+        exists = conn.execute(
+            "SELECT 1 FROM template_versions WHERE template_id = ? LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if exists:
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO template_versions (
+                id, template_id, version_number, name, category, description,
+                subject, preheader, html_body, text_body, is_active, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                make_id("tplver"),
+                row["id"],
+                1,
+                row["name"],
+                row["category"],
+                row["description"],
+                row["subject"],
+                row["preheader"],
+                row["html_body"],
+                row["text_body"],
+                row["is_active"],
+                row["updated_at"],
             ),
         )
