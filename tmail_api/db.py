@@ -69,6 +69,66 @@ CREATE TABLE IF NOT EXISTS tracked_links (
     created_at TEXT NOT NULL,
     FOREIGN KEY(message_id) REFERENCES messages(id)
 );
+
+CREATE TABLE IF NOT EXISTS templates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    category TEXT NOT NULL,
+    description TEXT,
+    subject TEXT NOT NULL,
+    preheader TEXT,
+    html_body TEXT NOT NULL,
+    text_body TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS seed_inboxes (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    label TEXT NOT NULL,
+    email_address TEXT,
+    notes TEXT,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS seed_test_runs (
+    id TEXT PRIMARY KEY,
+    identity_id TEXT NOT NULL,
+    message_id TEXT,
+    template_id TEXT,
+    subject TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    sent_at TEXT,
+    FOREIGN KEY(identity_id) REFERENCES identities(id),
+    FOREIGN KEY(message_id) REFERENCES messages(id),
+    FOREIGN KEY(template_id) REFERENCES templates(id)
+);
+
+CREATE TABLE IF NOT EXISTS seed_test_results (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    seed_inbox_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    label TEXT NOT NULL,
+    email_address TEXT,
+    accepted INTEGER,
+    placement TEXT,
+    render_status TEXT,
+    notes TEXT,
+    checked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES seed_test_runs(id),
+    FOREIGN KEY(seed_inbox_id) REFERENCES seed_inboxes(id)
+);
 """
 
 
@@ -92,6 +152,80 @@ DEFAULT_IDENTITIES = [
         "smtp_username": "tonyblum@me.com",
         "smtp_secret_env": "TMAIL_APPLE_WHEATANDSTONE_PASSWORD",
         "notes": "Apple custom-domain identity for branded sends. Auth rides through the owning Apple account username.",
+    },
+]
+
+DEFAULT_TEMPLATES = [
+    {
+        "id": "tpl-founder-note",
+        "name": "Founder Note",
+        "slug": "founder-note",
+        "category": "Founder",
+        "description": "A plainspoken founder outreach template with a soft CTA and clean fallback text.",
+        "subject": "Quick founder note from Tony",
+        "preheader": "A short, direct note sent through TMail.",
+        "html_body": "<html><body><p>Hey there,</p><p>I wanted to send a quick note directly and keep it simple.</p><p><a href=\"https://wheatandstone.ca\">Open the destination page</a></p><p>Tony</p></body></html>",
+        "text_body": "Hey there,\n\nI wanted to send a quick note directly and keep it simple.\n\nOpen the destination page: https://wheatandstone.ca\n\nTony",
+        "is_active": 1,
+    },
+    {
+        "id": "tpl-brand-checkpoint",
+        "name": "Brand Checkpoint",
+        "slug": "brand-checkpoint",
+        "category": "Operations",
+        "description": "A branded update template for product or campaign checkpoints.",
+        "subject": "TMail checkpoint update",
+        "preheader": "Progress update from the TMail operator desk.",
+        "html_body": "<html><body><p>Hello,</p><p>Here is the current TMail checkpoint and what changed in this pass.</p><ul><li>Sending rail verified</li><li>Tracking verified</li><li>Next build target defined</li></ul><p><a href=\"https://tmail.tokentap.ca/dashboard\">Open the dashboard</a></p></body></html>",
+        "text_body": "Hello,\n\nHere is the current TMail checkpoint and what changed in this pass.\n- Sending rail verified\n- Tracking verified\n- Next build target defined\n\nOpen the dashboard: https://tmail.tokentap.ca/dashboard",
+        "is_active": 1,
+    },
+    {
+        "id": "tpl-seed-lab",
+        "name": "Seed Lab Probe",
+        "slug": "seed-lab-probe",
+        "category": "Testing",
+        "description": "A minimal test message for seed inbox placement and render capture.",
+        "subject": "TMail seed test probe",
+        "preheader": "Seed inbox validation run from TMail.",
+        "html_body": "<html><body><p>This is a TMail seed test probe.</p><p><a href=\"https://api.tmail.tokentap.ca/api/health\">Check the API health endpoint</a></p></body></html>",
+        "text_body": "This is a TMail seed test probe.\n\nCheck the API health endpoint: https://api.tmail.tokentap.ca/api/health",
+        "is_active": 1,
+    },
+]
+
+DEFAULT_SEED_INBOXES = [
+    {
+        "id": "seed-gmail",
+        "provider": "Gmail",
+        "label": "Gmail Primary",
+        "email_address": "",
+        "notes": "Configure a real Gmail seed inbox before enabling.",
+        "enabled": 0,
+    },
+    {
+        "id": "seed-outlook",
+        "provider": "Outlook",
+        "label": "Outlook Primary",
+        "email_address": "",
+        "notes": "Configure a real Outlook/Hotmail seed inbox before enabling.",
+        "enabled": 0,
+    },
+    {
+        "id": "seed-yahoo",
+        "provider": "Yahoo",
+        "label": "Yahoo Primary",
+        "email_address": "",
+        "notes": "Configure a real Yahoo seed inbox before enabling.",
+        "enabled": 0,
+    },
+    {
+        "id": "seed-icloud",
+        "provider": "iCloud",
+        "label": "iCloud Primary",
+        "email_address": "",
+        "notes": "Configure a real iCloud seed inbox before enabling.",
+        "enabled": 0,
     },
 ]
 
@@ -128,6 +262,8 @@ def init_db() -> None:
     with get_connection() as conn:
         conn.executescript(SCHEMA)
         seed_default_identities(conn)
+        seed_default_templates(conn)
+        seed_default_seed_inboxes(conn)
 
 
 def seed_default_identities(conn: sqlite3.Connection) -> None:
@@ -166,6 +302,71 @@ def seed_default_identities(conn: sqlite3.Connection) -> None:
                 1,
                 "attention",
                 identity["notes"],
+                now,
+                now,
+            ),
+        )
+
+
+def seed_default_templates(conn: sqlite3.Connection) -> None:
+    for template in DEFAULT_TEMPLATES:
+        exists = conn.execute(
+            "SELECT 1 FROM templates WHERE id = ?",
+            (template["id"],),
+        ).fetchone()
+        if exists:
+            continue
+
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO templates (
+                id, name, slug, category, description, subject,
+                preheader, html_body, text_body, is_active,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                template["id"],
+                template["name"],
+                template["slug"],
+                template["category"],
+                template["description"],
+                template["subject"],
+                template["preheader"],
+                template["html_body"],
+                template["text_body"],
+                template["is_active"],
+                now,
+                now,
+            ),
+        )
+
+
+def seed_default_seed_inboxes(conn: sqlite3.Connection) -> None:
+    for seed in DEFAULT_SEED_INBOXES:
+        exists = conn.execute(
+            "SELECT 1 FROM seed_inboxes WHERE id = ?",
+            (seed["id"],),
+        ).fetchone()
+        if exists:
+            continue
+
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO seed_inboxes (
+                id, provider, label, email_address, notes, enabled,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                seed["id"],
+                seed["provider"],
+                seed["label"],
+                seed["email_address"],
+                seed["notes"],
+                seed["enabled"],
                 now,
                 now,
             ),

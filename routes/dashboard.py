@@ -2,12 +2,13 @@ from flask import Blueprint, jsonify
 
 from tmail_api.analytics import build_stats_payload
 from tmail_api.deliverability import DeliverabilityService
-from tmail_api.repositories import IdentityRepository, MessageRepository
+from tmail_api.repositories import IdentityRepository, MessageRepository, SeedTestRepository
 
 bp = Blueprint("dashboard", __name__)
 identities = IdentityRepository()
 messages = MessageRepository()
 diagnostics = DeliverabilityService()
+seed_runs = SeedTestRepository()
 
 
 def build_domain_summary() -> list[dict[str, str]]:
@@ -54,5 +55,6 @@ def summary():
             "identities": identities.list(),
             "domains": domains,
             "alerts": build_alerts(domains),
+            "seed_preview": seed_runs.latest_preview(),
         }
     )

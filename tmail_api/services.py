@@ -6,7 +6,7 @@ from typing import Any
 from tmail_api.db import utc_now
 from tmail_api.instrumentation import InstrumentationService
 from tmail_api.mail import AppleSMTPProvider, MailProviderError
-from tmail_api.repositories import IdentityRepository, MessageRepository
+from tmail_api.repositories import IdentityRepository, MessageRepository, SeedInboxRepository, SeedTestRepository
 
 
 class MailWorkflowService:
@@ -108,3 +108,69 @@ class MailWorkflowService:
             return {"identity_id": identity_id, "ok": True, **asdict(result)}
         except MailProviderError as exc:
             return {"identity_id": identity_id, "ok": False, "status": "error", "detail": str(exc)}
+
+
+class SeedLabService:
+    def __init__(self) -> None:
+        self.identities = IdentityRepository()
+        self.seed_inboxes = SeedInboxRepository()
+        self.seed_runs = SeedTestRepository()
+        self.mail = MailWorkflowService()
+
+    def launch_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        identity_id = str(payload.get("identity_id") or "")
+        if not identity_id:
+            raise ValueError("Identity is required")
+        if not payload.get("subject"):
+            raise ValueError("Subject is required")
+        if not payload.get("html_body"):
+            raise ValueError("HTML body is required")
+
+        enabled_seed_inboxes = self.seed_inboxes.enabled()
+        if not enabled_seed_inboxes:
+            raise ValueError("Configure and enable at least one seed inbox before launching a run.")
+
+        recipients = [seed["email_address"] for seed in enabled_seed_inboxes if seed.get("email_address")]
+        if not recipients:
+            raise ValueError("Enabled seed inboxes are missing email addresses.")
+
+        message = self.mail.save_or_send(
+            {
+                "identity_id": identity_id,
+                "recipients": recipients,
+                "subject": payload["subject"],
+                "preheader": payload.get("preheader", ""),
+                "html_body": payload["html_body"],
+                "text_body": payload.get("text_body", ""),
+                "tracking_enabled": payload.get("tracking_enabled", True),
+                "pixel_enabled": payload.get("pixel_enabled", True),
+                "action": "send_test",
+            }
+        )
+
+        status = "sent" if message.get("status") == "Sent" else "needs_review"
+        summary = (
+            f"Seed run sent to {len(recipients)} inboxes. Record placement after checking the real inboxes."
+            if status == "sent"
+            else message.get("error_message") or "Seed run send needs review."
+        )
+
+        return self.seed_runs.create_run(
+            identity_id=identity_id,
+            message_id=message.get("id"),
+            template_id=payload.get("template_id"),
+            subject=str(payload["subject"]),
+            status=status,
+            summary=summary,
+            sent_at=message.get("sent_at"),
+            seed_inboxes=enabled_seed_inboxes,
+        )
+
+    def record_results(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        results = payload.get("results") or []
+        if not isinstance(results, list):
+            raise ValueError("Results payload must be a list.")
+        updated = self.seed_runs.update_results(run_id, results)
+        if not updated:
+            raise ValueError("Seed run not found")
+        return updated
