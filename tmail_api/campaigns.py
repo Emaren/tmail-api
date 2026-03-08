@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -85,6 +87,7 @@ class CampaignRepository:
         now = utc_now()
         existing = self.get(campaign_id) if payload.get("id") else None
         audience_emails = "\n".join(parse_audience_emails(str(payload.get("audience_emails") or "")))
+        scheduled_for = parse_scheduled_at(str(payload.get("scheduled_for") or "").strip() or None)
         row = {
             "id": campaign_id,
             "name": name,
@@ -96,7 +99,7 @@ class CampaignRepository:
             "audience_emails": audience_emails,
             "send_window": str(payload.get("send_window") or "").strip(),
             "notes": str(payload.get("notes") or "").strip(),
-            "scheduled_for": str(payload.get("scheduled_for") or "").strip() or None,
+            "scheduled_for": scheduled_for.isoformat() if scheduled_for else None,
             "created_at": existing["created_at"] if existing else now,
             "updated_at": now,
         }
@@ -249,25 +252,153 @@ class CampaignRepository:
         }
 
     def run_due(self, limit: int = 5) -> list[dict[str, Any]]:
+        return self.run_scheduler(limit=limit, trigger_type="manual")["items"]
+
+    def run_scheduler(self, limit: int = 5, *, trigger_type: str = "manual") -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        started_at = utc_now()
+        scheduler_run_id = make_id("scheduler")
+        items: list[dict[str, Any]] = []
+        failures: list[str] = []
+
+        with get_connection() as conn:
+            due_rows = self._due_rows(conn, now=now, limit=limit)
+            conn.execute(
+                """
+                INSERT INTO scheduler_runs (
+                    id, scope, trigger_type, status, due_count, launched_count,
+                    failed_count, summary, campaign_ids_json, run_ids_json,
+                    started_at, completed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scheduler_run_id,
+                    "campaigns",
+                    trigger_type,
+                    "running",
+                    len(due_rows),
+                    0,
+                    0,
+                    "Scheduler run started.",
+                    "[]",
+                    "[]",
+                    started_at,
+                    None,
+                    started_at,
+                    started_at,
+                ),
+            )
+
+        for row in due_rows:
+            try:
+                items.append(self.launch(row["id"], trigger_type="scheduled"))
+            except ValueError as exc:
+                failures.append(f"{row['id']}: {exc}")
+                self._release_scheduled_campaign(row["id"])
+                items.append(
+                    {
+                        "campaign": self.get(row["id"]),
+                        "run": None,
+                        "error": str(exc),
+                    }
+                )
+
+        launched_count = sum(1 for item in items if item.get("run"))
+        failed_count = len(items) - launched_count
+        review_count = sum(
+            1
+            for item in items
+            if item.get("run") and item["run"].get("status") in {"partial", "needs_review"}
+        )
+        if not items:
+            status = "idle"
+            summary = "No scheduled campaigns were due."
+        elif failed_count or review_count:
+            status = "needs_review"
+            summary = f"Scheduler touched {len(items)} campaign(s). Review {failed_count + review_count} campaign outcome(s)."
+        else:
+            status = "completed"
+            summary = f"Scheduler executed {len(items)} scheduled campaign(s)."
+
+        completed_at = utc_now()
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE scheduler_runs
+                SET status = ?,
+                    launched_count = ?,
+                    failed_count = ?,
+                    summary = ?,
+                    campaign_ids_json = ?,
+                    run_ids_json = ?,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    launched_count,
+                    failed_count,
+                    summary if not failures else f"{summary} {' | '.join(failures[:3])}",
+                    json.dumps([item["campaign"]["id"] for item in items if item.get("campaign")], separators=(",", ":")),
+                    json.dumps([item["run"]["id"] for item in items if item.get("run")], separators=(",", ":")),
+                    completed_at,
+                    completed_at,
+                    scheduler_run_id,
+                ),
+            )
+
+        return {
+            "run": self.get_scheduler_run(scheduler_run_id),
+            "items": items,
+            "status": self.get_scheduler_status(),
+        }
+
+    def get_scheduler_status(self, recent_limit: int = 4) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         with get_connection() as conn:
-            rows = conn.execute(
+            due_rows = self._due_rows(conn, now=now, limit=None)
+            next_scheduled = None
+            future_rows = self._scheduled_rows(conn)
+            for row in future_rows:
+                scheduled = parse_scheduled_at(row["scheduled_for"])
+                if scheduled and scheduled > now:
+                    next_scheduled = scheduled.isoformat()
+                    break
+
+            recent_rows = conn.execute(
                 """
-                SELECT id, scheduled_for
-                FROM campaigns
-                WHERE status = 'scheduled' AND scheduled_for IS NOT NULL AND scheduled_for != ''
-                ORDER BY scheduled_for ASC, updated_at ASC
+                SELECT * FROM scheduler_runs
+                WHERE scope = 'campaigns'
+                ORDER BY started_at DESC, created_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (recent_limit,),
             ).fetchall()
+            total_scheduled = conn.execute(
+                "SELECT COUNT(*) AS total FROM campaigns WHERE status = 'scheduled'"
+            ).fetchone()["total"] or 0
 
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            scheduled = parse_scheduled_at(row["scheduled_for"])
-            if scheduled and scheduled <= now:
-                results.append(self.launch(row["id"], trigger_type="scheduled"))
-        return results
+        recent_runs = [self._scheduler_run_to_dict(row) for row in recent_rows]
+        return {
+            "interval_minutes": max(int(os.getenv("TMAIL_CAMPAIGN_SCHEDULER_INTERVAL_MINUTES", "5") or "5"), 1),
+            "scheduled_count": total_scheduled,
+            "due_count": len(due_rows),
+            "next_scheduled_for": next_scheduled,
+            "last_run": recent_runs[0] if recent_runs else None,
+            "recent_runs": recent_runs,
+        }
+
+    def get_scheduler_run(self, scheduler_run_id: str) -> dict[str, Any] | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM scheduler_runs
+                WHERE id = ?
+                """,
+                (scheduler_run_id,),
+            ).fetchone()
+            return self._scheduler_run_to_dict(row) if row else None
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with get_connection() as conn:
@@ -292,6 +423,38 @@ class CampaignRepository:
         ).fetchall()
         return [self._run_to_dict(row) for row in rows]
 
+    def _scheduled_rows(self, conn: Any) -> list[Any]:
+        return conn.execute(
+            """
+            SELECT id, scheduled_for
+            FROM campaigns
+            WHERE status = 'scheduled' AND scheduled_for IS NOT NULL AND scheduled_for != ''
+            ORDER BY scheduled_for ASC, updated_at ASC
+            """
+        ).fetchall()
+
+    def _due_rows(self, conn: Any, *, now: datetime, limit: int | None) -> list[Any]:
+        due_rows: list[Any] = []
+        for row in self._scheduled_rows(conn):
+            scheduled = parse_scheduled_at(row["scheduled_for"])
+            if scheduled and scheduled <= now:
+                due_rows.append(row)
+                if limit and len(due_rows) >= limit:
+                    break
+        return due_rows
+
+    def _release_scheduled_campaign(self, campaign_id: str) -> None:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE campaigns
+                SET status = 'ready',
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), campaign_id),
+            )
+
     def _run_to_dict(self, row: Any) -> dict[str, Any]:
         return {
             "id": row["id"],
@@ -303,6 +466,24 @@ class CampaignRepository:
             "recipient_count": row["recipient_count"],
             "sent_count": row["sent_count"],
             "summary": row["summary"] or "",
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _scheduler_run_to_dict(self, row: Any) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "scope": row["scope"],
+            "trigger_type": row["trigger_type"],
+            "status": row["status"],
+            "due_count": row["due_count"],
+            "launched_count": row["launched_count"],
+            "failed_count": row["failed_count"],
+            "summary": row["summary"] or "",
+            "campaign_ids": json.loads(row["campaign_ids_json"] or "[]"),
+            "run_ids": json.loads(row["run_ids_json"] or "[]"),
             "started_at": row["started_at"],
             "completed_at": row["completed_at"],
             "created_at": row["created_at"],

@@ -39,7 +39,21 @@ def launch_campaign(campaign_id: str):
         return jsonify({'error': str(exc)}), status
 
 
+@bp.route('/campaigns/scheduler', methods=['GET'])
+def get_scheduler_status():
+    return jsonify(repo.get_scheduler_status())
+
+
+@bp.route('/campaigns/scheduler/run', methods=['POST'])
+def run_scheduler():
+    payload = request.get_json(silent=True) or {}
+    limit = int(payload.get('limit') or 5)
+    trigger_type = str(payload.get('trigger_type') or 'manual').strip().lower() or 'manual'
+    return jsonify(repo.run_scheduler(limit=limit, trigger_type=trigger_type))
+
+
 @bp.route('/campaigns/run-due', methods=['POST'])
 def run_due_campaigns():
     limit = int((request.get_json(silent=True) or {}).get('limit') or 5)
-    return jsonify({'items': repo.run_due(limit=limit)})
+    result = repo.run_scheduler(limit=limit, trigger_type='manual')
+    return jsonify({'items': result['items'], 'run': result['run'], 'status': result['status']})

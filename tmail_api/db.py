@@ -237,6 +237,23 @@ CREATE TABLE IF NOT EXISTS campaign_runs (
     FOREIGN KEY(campaign_id) REFERENCES campaigns(id),
     FOREIGN KEY(message_id) REFERENCES messages(id)
 );
+
+CREATE TABLE IF NOT EXISTS scheduler_runs (
+    id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL DEFAULT 'campaigns',
+    trigger_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    due_count INTEGER NOT NULL DEFAULT 0,
+    launched_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    summary TEXT,
+    campaign_ids_json TEXT NOT NULL DEFAULT '[]',
+    run_ids_json TEXT NOT NULL DEFAULT '[]',
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
