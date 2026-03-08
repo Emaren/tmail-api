@@ -354,6 +354,7 @@ def init_db() -> None:
         run_migrations(conn)
         seed_default_identities(conn)
         seed_default_templates(conn)
+        repair_default_template_content(conn)
         seed_missing_template_versions(conn)
         seed_default_seed_inboxes(conn)
         seed_default_operator(conn)
@@ -450,6 +451,26 @@ def seed_default_templates(conn: sqlite3.Connection) -> None:
                 now,
             ),
         )
+
+
+def repair_default_template_content(conn: sqlite3.Connection) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE templates
+        SET html_body = ?,
+            text_body = ?,
+            updated_at = ?
+        WHERE id = 'tpl-seed-lab'
+          AND (html_body LIKE '%https://api.tmail.tokentap.ca/api/health%'
+               OR text_body LIKE '%https://api.tmail.tokentap.ca/api/health%')
+        """,
+        (
+            "<html><body><p>This is a TMail seed test probe.</p><p><a href=\"https://api.tmail.tokentap.ca/healthz\">Check the public API health endpoint</a></p></body></html>",
+            "This is a TMail seed test probe.\n\nCheck the public API health endpoint: https://api.tmail.tokentap.ca/healthz",
+            now,
+        ),
+    )
 
 
 def seed_default_seed_inboxes(conn: sqlite3.Connection) -> None:
