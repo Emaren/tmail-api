@@ -1,6 +1,6 @@
 from flask import Flask, jsonify
 
-from routes import analytics, auth, campaigns, contacts, dashboard, deliverability, health, identities, messages, seed_tests, stats, templates, tracking
+from routes import analytics, auth, campaigns, contacts, dashboard, deliverability, health, identities, messages, seed_tests, segments, stats, templates, tracking
 from tmail_api.auth import enforce_internal_api_auth
 from tmail_api.db import init_db
 
@@ -17,6 +17,7 @@ def create_app() -> Flask:
     app.register_blueprint(analytics.bp, url_prefix="/api")
     app.register_blueprint(campaigns.bp, url_prefix="/api")
     app.register_blueprint(contacts.bp, url_prefix="/api")
+    app.register_blueprint(segments.bp, url_prefix="/api")
     app.register_blueprint(dashboard.bp, url_prefix="/api")
     app.register_blueprint(deliverability.bp, url_prefix="/api")
     app.register_blueprint(seed_tests.bp, url_prefix="/api")

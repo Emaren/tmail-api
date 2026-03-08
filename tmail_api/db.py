@@ -84,6 +84,16 @@ CREATE TABLE IF NOT EXISTS contacts (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS segments (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    match_mode TEXT NOT NULL DEFAULT 'any',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL,
@@ -209,6 +219,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
     status TEXT NOT NULL DEFAULT 'draft',
     identity_id TEXT NOT NULL,
     template_id TEXT,
+    audience_source TEXT NOT NULL DEFAULT 'manual',
+    segment_id TEXT,
     audience_label TEXT NOT NULL,
     audience_emails TEXT,
     send_window TEXT,
@@ -217,7 +229,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(identity_id) REFERENCES identities(id),
-    FOREIGN KEY(template_id) REFERENCES templates(id)
+    FOREIGN KEY(template_id) REFERENCES templates(id),
+    FOREIGN KEY(segment_id) REFERENCES segments(id)
 );
 
 CREATE TABLE IF NOT EXISTS campaign_runs (
@@ -401,6 +414,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "messages", "template_id", "TEXT")
     ensure_column(conn, "messages", "campaign_id", "TEXT")
     ensure_column(conn, "campaigns", "audience_emails", "TEXT")
+    ensure_column(conn, "campaigns", "audience_source", "TEXT DEFAULT 'manual'")
+    ensure_column(conn, "campaigns", "segment_id", "TEXT")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

@@ -14,6 +14,15 @@ def slugify(value: str) -> str:
     return slug or make_id("tpl")
 
 
+def normalize_tags(values: list[Any] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in values or []:
+        tag = str(value or "").strip().lower()
+        if tag and tag not in normalized:
+            normalized.append(tag)
+    return normalized
+
+
 class IdentityRepository:
     def list(self) -> list[dict[str, Any]]:
         with get_connection() as conn:
@@ -725,7 +734,7 @@ class ContactRepository:
             "email_address": email_address,
             "display_name": str(payload.get("display_name") or existing_display_name).strip(),
             "company": str(payload.get("company") or existing_company).strip(),
-            "tags_json": json.dumps(tags if isinstance(tags, list) else []),
+            "tags_json": json.dumps(normalize_tags(tags if isinstance(tags, list) else []), separators=(",", ":")),
             "source": str(payload.get("source") or existing_source).strip(),
             "notes": str(payload.get("notes") or existing_notes).strip(),
             "created_at": existing["created_at"] if existing else now,
@@ -762,7 +771,7 @@ class ContactRepository:
         return self.get(row["id"])  # type: ignore[return-value]
 
     def _row_to_summary(self, row: sqlite3.Row) -> dict[str, Any]:
-        tags = json.loads(row["tags_json"] or "[]") if row["tags_json"] else []
+        tags = normalize_tags(json.loads(row["tags_json"] or "[]") if row["tags_json"] else [])
         click_count = int(row["click_count"] or 0)
         reply_count = int(row["reply_count"] or 0)
         conversion_count = int(row["conversion_count"] or 0)
@@ -787,6 +796,144 @@ class ContactRepository:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+
+class SegmentRepository:
+    VALID_MATCH_MODES = {"any", "all"}
+
+    def list(self, limit: int = 80) -> list[dict[str, Any]]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM segments
+                ORDER BY updated_at DESC, name ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [self._row_to_dict(row, conn=conn) for row in rows]
+
+    def get(self, segment_id: str) -> dict[str, Any] | None:
+        with get_connection() as conn:
+            row = conn.execute("SELECT * FROM segments WHERE id = ?", (segment_id,)).fetchone()
+            return self._row_to_dict(row, conn=conn) if row else None
+
+    def save(self, payload: dict[str, Any]) -> dict[str, Any]:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise ValueError("Segment name is required.")
+
+        match_mode = str(payload.get("match_mode") or "any").strip().lower()
+        if match_mode not in self.VALID_MATCH_MODES:
+            raise ValueError("Match mode must be 'any' or 'all'.")
+
+        tags = normalize_tags(payload.get("tags") if isinstance(payload.get("tags"), list) else [])
+        if not tags:
+            raise ValueError("Add at least one tag to define the segment.")
+
+        segment_id = str(payload.get("id") or "")
+        existing = self.get(segment_id) if segment_id else None
+        now = utc_now()
+        row = {
+            "id": segment_id or make_id("segment"),
+            "name": name,
+            "description": str(payload.get("description") or (existing.get("description") if existing else "") or "").strip(),
+            "match_mode": match_mode,
+            "tags_json": json.dumps(tags, separators=(",", ":")),
+            "created_at": existing["created_at"] if existing else now,
+            "updated_at": now,
+        }
+
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO segments (
+                    id, name, description, match_mode, tags_json, created_at, updated_at
+                ) VALUES (
+                    :id, :name, :description, :match_mode, :tags_json, :created_at, :updated_at
+                )
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    match_mode = excluded.match_mode,
+                    tags_json = excluded.tags_json,
+                    updated_at = excluded.updated_at
+                """,
+                row,
+            )
+        return self.get(row["id"])  # type: ignore[return-value]
+
+    def resolve_contacts(self, segment_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+        with get_connection() as conn:
+            row = conn.execute("SELECT * FROM segments WHERE id = ?", (segment_id,)).fetchone()
+            if not row:
+                return []
+            return self._resolve_contacts(conn, row, limit=limit)
+
+    def resolve_email_addresses(self, segment_id: str) -> list[str]:
+        contacts = self.resolve_contacts(segment_id)
+        return [contact["email_address"] for contact in contacts if contact.get("email_address")]
+
+    def _row_to_dict(self, row: sqlite3.Row, *, conn: sqlite3.Connection) -> dict[str, Any]:
+        tags = normalize_tags(json.loads(row["tags_json"] or "[]") if row["tags_json"] else [])
+        contacts = self._resolve_contacts(conn, row, limit=6)
+        all_contacts = self._resolve_contacts(conn, row, limit=None)
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "description": row["description"] or "",
+            "match_mode": row["match_mode"] or "any",
+            "tags": tags,
+            "contact_count": len(all_contacts),
+            "contact_emails": [contact["email_address"] for contact in contacts if contact.get("email_address")],
+            "contacts_preview": [
+                {
+                    "id": contact["id"],
+                    "email_address": contact["email_address"],
+                    "display_name": contact["display_name"] or "",
+                    "company": contact["company"] or "",
+                }
+                for contact in contacts
+            ],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _resolve_contacts(self, conn: sqlite3.Connection, row: sqlite3.Row, *, limit: int | None) -> list[dict[str, Any]]:
+        tags = normalize_tags(json.loads(row["tags_json"] or "[]") if row["tags_json"] else [])
+        if not tags:
+            return []
+
+        contacts = conn.execute(
+            """
+            SELECT id, email_address, display_name, company, tags_json
+            FROM contacts
+            ORDER BY updated_at DESC, email_address ASC
+            """
+        ).fetchall()
+        matched: list[dict[str, Any]] = []
+        for contact in contacts:
+            contact_tags = set(normalize_tags(json.loads(contact["tags_json"] or "[]") if contact["tags_json"] else []))
+            if not contact_tags:
+                continue
+            if row["match_mode"] == "all":
+                ok = all(tag in contact_tags for tag in tags)
+            else:
+                ok = any(tag in contact_tags for tag in tags)
+            if not ok:
+                continue
+            matched.append(
+                {
+                    "id": contact["id"],
+                    "email_address": contact["email_address"],
+                    "display_name": contact["display_name"] or "",
+                    "company": contact["company"] or "",
+                }
+            )
+            if limit and len(matched) >= limit:
+                break
+        return matched
 
 
 class TemplateRepository:

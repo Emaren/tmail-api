@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from tmail_api.db import get_connection, make_id, utc_now
-from tmail_api.repositories import TemplateRepository
+from tmail_api.repositories import SegmentRepository, TemplateRepository
 from tmail_api.services import MailWorkflowService
 
 
@@ -39,6 +39,7 @@ class CampaignRepository:
 
     def __init__(self) -> None:
         self.templates = TemplateRepository()
+        self.segments = SegmentRepository()
         self.mail = MailWorkflowService()
 
     def list(self) -> list[dict[str, Any]]:
@@ -47,10 +48,12 @@ class CampaignRepository:
                 """
                 SELECT campaigns.*, identities.email_address AS identity_email,
                        identities.label AS identity_label,
-                       templates.name AS template_name
+                       templates.name AS template_name,
+                       segments.name AS segment_name
                 FROM campaigns
                 JOIN identities ON identities.id = campaigns.identity_id
                 LEFT JOIN templates ON templates.id = campaigns.template_id
+                LEFT JOIN segments ON segments.id = campaigns.segment_id
                 ORDER BY campaigns.updated_at DESC, campaigns.created_at DESC
                 """
             ).fetchall()
@@ -62,10 +65,12 @@ class CampaignRepository:
                 """
                 SELECT campaigns.*, identities.email_address AS identity_email,
                        identities.label AS identity_label,
-                       templates.name AS template_name
+                       templates.name AS template_name,
+                       segments.name AS segment_name
                 FROM campaigns
                 JOIN identities ON identities.id = campaigns.identity_id
                 LEFT JOIN templates ON templates.id = campaigns.template_id
+                LEFT JOIN segments ON segments.id = campaigns.segment_id
                 WHERE campaigns.id = ?
                 """,
                 (campaign_id,),
@@ -78,16 +83,28 @@ class CampaignRepository:
         identity_id = str(payload.get("identity_id") or "").strip()
         audience_label = str(payload.get("audience_label") or "").strip()
         status = str(payload.get("status") or "draft").strip().lower()
+        audience_source = str(payload.get("audience_source") or "manual").strip().lower()
+        segment_id = str(payload.get("segment_id") or "").strip() or None
         if not name or not objective or not identity_id or not audience_label:
             raise ValueError("Name, objective, identity, and audience are required.")
         if status not in self.VALID_STATUSES:
             raise ValueError("Invalid campaign status.")
+        if audience_source not in {"manual", "segment"}:
+            raise ValueError("Audience source must be 'manual' or 'segment'.")
 
         campaign_id = str(payload.get("id") or make_id("campaign"))
         now = utc_now()
         existing = self.get(campaign_id) if payload.get("id") else None
         audience_emails = "\n".join(parse_audience_emails(str(payload.get("audience_emails") or "")))
         scheduled_for = parse_scheduled_at(str(payload.get("scheduled_for") or "").strip() or None)
+        if audience_source == "segment":
+            if not segment_id:
+                raise ValueError("Choose a segment for segment-backed campaigns.")
+            if not self.segments.get(segment_id):
+                raise ValueError("Linked segment not found.")
+            audience_emails = ""
+        elif not audience_emails and status in {"ready", "scheduled", "live", "completed"}:
+            raise ValueError("Add at least one audience email for manual-list campaigns.")
         row = {
             "id": campaign_id,
             "name": name,
@@ -95,6 +112,8 @@ class CampaignRepository:
             "status": status,
             "identity_id": identity_id,
             "template_id": str(payload.get("template_id") or "").strip() or None,
+            "audience_source": audience_source,
+            "segment_id": segment_id,
             "audience_label": audience_label,
             "audience_emails": audience_emails,
             "send_window": str(payload.get("send_window") or "").strip(),
@@ -108,11 +127,11 @@ class CampaignRepository:
                 """
                 INSERT INTO campaigns (
                     id, name, objective, status, identity_id, template_id,
-                    audience_label, audience_emails, send_window, notes, scheduled_for,
+                    audience_source, segment_id, audience_label, audience_emails, send_window, notes, scheduled_for,
                     created_at, updated_at
                 ) VALUES (
                     :id, :name, :objective, :status, :identity_id, :template_id,
-                    :audience_label, :audience_emails, :send_window, :notes, :scheduled_for,
+                    :audience_source, :segment_id, :audience_label, :audience_emails, :send_window, :notes, :scheduled_for,
                     :created_at, :updated_at
                 )
                 ON CONFLICT(id) DO UPDATE SET
@@ -121,6 +140,8 @@ class CampaignRepository:
                     status = excluded.status,
                     identity_id = excluded.identity_id,
                     template_id = excluded.template_id,
+                    audience_source = excluded.audience_source,
+                    segment_id = excluded.segment_id,
                     audience_label = excluded.audience_label,
                     audience_emails = excluded.audience_emails,
                     send_window = excluded.send_window,
@@ -139,9 +160,9 @@ class CampaignRepository:
         if not campaign.get("template_id"):
             raise ValueError("Link a template before launching the campaign.")
 
-        recipients = parse_audience_emails(str(campaign.get("audience_emails") or ""))
+        recipients = self._resolve_recipients(campaign)
         if not recipients:
-            raise ValueError("Add at least one audience email before launching the campaign.")
+            raise ValueError("Add at least one audience recipient before launching the campaign.")
 
         template = self.templates.get(str(campaign["template_id"]))
         if not template:
@@ -514,6 +535,9 @@ class CampaignRepository:
         counts_by_type = {item["event_type"]: item["total"] for item in event_counts}
         recent_runs = self._recent_runs(conn, row["id"])
         audience_emails = row["audience_emails"] or ""
+        audience_source = row["audience_source"] or "manual"
+        segment = self.segments.get(row["segment_id"]) if row["segment_id"] else None
+        audience_count = len(self._resolve_recipients(row))
         return {
             "id": row["id"],
             "name": row["name"],
@@ -524,9 +548,13 @@ class CampaignRepository:
             "identity_label": row["identity_label"],
             "template_id": row["template_id"],
             "template_name": row["template_name"],
+            "audience_source": audience_source,
+            "segment_id": row["segment_id"],
+            "segment_name": row["segment_name"],
             "audience_label": row["audience_label"],
             "audience_emails": audience_emails,
-            "audience_count": len(parse_audience_emails(audience_emails)),
+            "audience_count": audience_count,
+            "segment_contact_emails": segment["contact_emails"] if segment else [],
             "send_window": row["send_window"] or "",
             "notes": row["notes"] or "",
             "scheduled_for": row["scheduled_for"],
@@ -541,3 +569,13 @@ class CampaignRepository:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def _resolve_recipients(self, campaign: Any) -> list[str]:
+        audience_source = campaign["audience_source"] if "audience_source" in campaign.keys() else campaign.get("audience_source", "manual")
+        if audience_source == "segment":
+            segment_id = campaign["segment_id"] if "segment_id" in campaign.keys() else campaign.get("segment_id")
+            if not segment_id:
+                return []
+            return self.segments.resolve_email_addresses(str(segment_id))
+        audience_emails = campaign["audience_emails"] if "audience_emails" in campaign.keys() else campaign.get("audience_emails", "")
+        return parse_audience_emails(str(audience_emails or ""))
