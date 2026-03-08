@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from tmail_api.db import ensure_contact_row, get_connection, make_id, utc_now
@@ -833,10 +834,23 @@ class SegmentRepository:
         company_contains = str(payload.get("company_contains") or "").strip()
         source_filter = str(payload.get("source_filter") or "").strip().lower()
         engagement_filter = str(payload.get("engagement_filter") or "any").strip().lower()
+        last_activity_days = self._optional_non_negative_int(payload.get("last_activity_days"), "Last activity days")
+        min_sent_count = self._optional_non_negative_int(payload.get("min_sent_count"), "Minimum sent count")
+        max_sent_count = self._optional_non_negative_int(payload.get("max_sent_count"), "Maximum sent count")
         if engagement_filter not in self.VALID_ENGAGEMENT_FILTERS:
             raise ValueError("Invalid engagement filter.")
-        if not any([tags, company_contains, source_filter, engagement_filter != "any"]):
-            raise ValueError("Add at least one segment rule: tags, company, source, or engagement.")
+        if min_sent_count is not None and max_sent_count is not None and min_sent_count > max_sent_count:
+            raise ValueError("Minimum sent count cannot be greater than maximum sent count.")
+        if not any([
+            tags,
+            company_contains,
+            source_filter,
+            engagement_filter != "any",
+            last_activity_days is not None,
+            min_sent_count is not None,
+            max_sent_count is not None,
+        ]):
+            raise ValueError("Add at least one segment rule: tags, company, source, engagement, recency, or send count.")
         if not tags:
             tags = []
 
@@ -852,6 +866,9 @@ class SegmentRepository:
             "company_contains": company_contains,
             "source_filter": source_filter,
             "engagement_filter": engagement_filter,
+            "last_activity_days": last_activity_days,
+            "min_sent_count": min_sent_count,
+            "max_sent_count": max_sent_count,
             "created_at": existing["created_at"] if existing else now,
             "updated_at": now,
         }
@@ -862,10 +879,12 @@ class SegmentRepository:
                 INSERT INTO segments (
                     id, name, description, match_mode, tags_json,
                     company_contains, source_filter, engagement_filter,
+                    last_activity_days, min_sent_count, max_sent_count,
                     created_at, updated_at
                 ) VALUES (
                     :id, :name, :description, :match_mode, :tags_json,
                     :company_contains, :source_filter, :engagement_filter,
+                    :last_activity_days, :min_sent_count, :max_sent_count,
                     :created_at, :updated_at
                 )
                 ON CONFLICT(id) DO UPDATE SET
@@ -876,6 +895,9 @@ class SegmentRepository:
                     company_contains = excluded.company_contains,
                     source_filter = excluded.source_filter,
                     engagement_filter = excluded.engagement_filter,
+                    last_activity_days = excluded.last_activity_days,
+                    min_sent_count = excluded.min_sent_count,
+                    max_sent_count = excluded.max_sent_count,
                     updated_at = excluded.updated_at
                 """,
                 row,
@@ -906,6 +928,9 @@ class SegmentRepository:
             "company_contains": row["company_contains"] or "",
             "source_filter": row["source_filter"] or "",
             "engagement_filter": row["engagement_filter"] or "any",
+            "last_activity_days": row["last_activity_days"],
+            "min_sent_count": row["min_sent_count"],
+            "max_sent_count": row["max_sent_count"],
             "contact_count": len(all_contacts),
             "contact_emails": [contact["email_address"] for contact in contacts if contact.get("email_address")],
             "contacts_preview": [
@@ -926,11 +951,15 @@ class SegmentRepository:
         company_contains = str(row["company_contains"] or "").strip().lower()
         source_filter = str(row["source_filter"] or "").strip().lower()
         engagement_filter = str(row["engagement_filter"] or "any").strip().lower()
+        last_activity_days = row["last_activity_days"]
+        min_sent_count = row["min_sent_count"]
+        max_sent_count = row["max_sent_count"]
 
         contacts = ContactRepository().list(limit=None)
         matched: list[dict[str, Any]] = []
         for contact in contacts:
             contact_tags = set(normalize_tags(contact.get("tags") if isinstance(contact.get("tags"), list) else []))
+            sent_count = int(contact.get("sent_count") or 0)
             tags_ok = True
             if tags:
                 if row["match_mode"] == "all":
@@ -940,8 +969,10 @@ class SegmentRepository:
             company_ok = not company_contains or company_contains in str(contact.get("company") or "").lower()
             source_ok = not source_filter or source_filter == str(contact.get("source") or "").lower()
             engagement_ok = self._matches_engagement_filter(contact, engagement_filter)
+            last_activity_ok = self._matches_last_activity_filter(contact, last_activity_days)
+            sent_count_ok = self._matches_sent_count_filter(sent_count, min_sent_count=min_sent_count, max_sent_count=max_sent_count)
 
-            if not all([tags_ok, company_ok, source_ok, engagement_ok]):
+            if not all([tags_ok, company_ok, source_ok, engagement_ok, last_activity_ok, sent_count_ok]):
                 continue
             matched.append(
                 {
@@ -975,6 +1006,42 @@ class SegmentRepository:
         if engagement_filter == "quiet":
             return not any([conversion_count > 0, reply_count > 0, click_count > 0, open_count > 0])
         return True
+
+    def _matches_last_activity_filter(self, contact: dict[str, Any], last_activity_days: Any) -> bool:
+        if last_activity_days in (None, ""):
+            return True
+
+        last_activity_at = str(contact.get("last_activity_at") or "").strip()
+        if not last_activity_at:
+            return False
+
+        try:
+            activity_at = datetime.fromisoformat(last_activity_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+
+        if activity_at.tzinfo is None:
+            activity_at = activity_at.replace(tzinfo=timezone.utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(last_activity_days))
+        return activity_at >= cutoff
+
+    def _matches_sent_count_filter(self, sent_count: int, *, min_sent_count: Any, max_sent_count: Any) -> bool:
+        if min_sent_count not in (None, "") and sent_count < int(min_sent_count):
+            return False
+        if max_sent_count not in (None, "") and sent_count > int(max_sent_count):
+            return False
+        return True
+
+    def _optional_non_negative_int(self, value: Any, label: str) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} must be a whole number.") from exc
+        if normalized < 0:
+            raise ValueError(f"{label} cannot be negative.")
+        return normalized
 
 
 class TemplateRepository:

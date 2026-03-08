@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from tmail_api.config import get_settings
 from tmail_api.repositories import MessageRepository
@@ -28,7 +29,24 @@ class InstrumentationService:
     def preview_text(self, text_body: str, html_body: str) -> str:
         base = text_body.strip() or TAG_RE.sub(' ', html_body)
         compact = ' '.join(base.split())
-        return compact[:180]
+        sanitized = TEXT_URL_RE.sub(self._preview_url_replacement, compact)
+        sanitized = ' '.join(sanitized.split())
+        return sanitized[:140]
+
+    def _preview_url_replacement(self, match: re.Match[str]) -> str:
+        raw_url = match.group(0)
+        parsed = urlparse(raw_url)
+        host = (parsed.netloc or '').replace('www.', '')
+        if not host:
+            return 'link'
+        if '/api/tracking/click/' in parsed.path:
+            return f'link via {host}'
+        short_path = parsed.path.rstrip('/')
+        if not short_path or short_path == '/':
+            return host
+        if len(short_path) > 18:
+            short_path = f"{short_path[:15]}..."
+        return f"{host}{short_path}"
 
     def instrument(self, *, message_id: str, html_body: str, text_body: str, pixel_enabled: bool) -> InstrumentedContent:
         tracked_links: list[dict[str, str | None]] = []

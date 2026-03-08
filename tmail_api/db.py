@@ -93,6 +93,9 @@ CREATE TABLE IF NOT EXISTS segments (
     company_contains TEXT,
     source_filter TEXT,
     engagement_filter TEXT,
+    last_activity_days INTEGER,
+    min_sent_count INTEGER,
+    max_sent_count INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -422,6 +425,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "segments", "company_contains", "TEXT")
     ensure_column(conn, "segments", "source_filter", "TEXT")
     ensure_column(conn, "segments", "engagement_filter", "TEXT")
+    ensure_column(conn, "segments", "last_activity_days", "INTEGER")
+    ensure_column(conn, "segments", "min_sent_count", "INTEGER")
+    ensure_column(conn, "segments", "max_sent_count", "INTEGER")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
