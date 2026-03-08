@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ from typing import Iterator
 from uuid import uuid4
 
 from tmail_api.config import get_settings
+from tmail_api.security import hash_password
 
 
 SCHEMA = """
@@ -34,6 +36,8 @@ CREATE TABLE IF NOT EXISTS identities (
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     identity_id TEXT NOT NULL,
+    template_id TEXT,
+    campaign_id TEXT,
     subject TEXT NOT NULL,
     preheader TEXT,
     html_body TEXT NOT NULL,
@@ -50,6 +54,21 @@ CREATE TABLE IF NOT EXISTS messages (
     updated_at TEXT NOT NULL,
     sent_at TEXT,
     FOREIGN KEY(identity_id) REFERENCES identities(id)
+);
+
+CREATE TABLE IF NOT EXISTS operators (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'owner',
+    password_hash TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    totp_secret TEXT,
+    pending_totp_secret TEXT,
+    totp_enabled INTEGER NOT NULL DEFAULT 0,
+    last_login_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -144,6 +163,23 @@ CREATE TABLE IF NOT EXISTS seed_test_results (
     updated_at TEXT NOT NULL,
     FOREIGN KEY(run_id) REFERENCES seed_test_runs(id),
     FOREIGN KEY(seed_inbox_id) REFERENCES seed_inboxes(id)
+);
+
+CREATE TABLE IF NOT EXISTS campaigns (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    identity_id TEXT NOT NULL,
+    template_id TEXT,
+    audience_label TEXT NOT NULL,
+    send_window TEXT,
+    notes TEXT,
+    scheduled_for TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(identity_id) REFERENCES identities(id),
+    FOREIGN KEY(template_id) REFERENCES templates(id)
 );
 """
 
@@ -259,6 +295,7 @@ def connect() -> sqlite3.Connection:
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(settings.db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -277,10 +314,27 @@ def init_db() -> None:
     Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     with get_connection() as conn:
         conn.executescript(SCHEMA)
+        run_migrations(conn)
         seed_default_identities(conn)
         seed_default_templates(conn)
         seed_missing_template_versions(conn)
         seed_default_seed_inboxes(conn)
+        seed_default_operator(conn)
+
+
+def run_migrations(conn: sqlite3.Connection) -> None:
+    ensure_column(conn, "messages", "template_id", "TEXT")
+    ensure_column(conn, "messages", "campaign_id", "TEXT")
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column in existing:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def seed_default_identities(conn: sqlite3.Connection) -> None:
@@ -422,3 +476,39 @@ def seed_missing_template_versions(conn: sqlite3.Connection) -> None:
                 row["updated_at"],
             ),
         )
+
+
+def seed_default_operator(conn: sqlite3.Connection) -> None:
+    existing = conn.execute("SELECT COUNT(*) AS total FROM operators").fetchone()
+    if existing and existing["total"]:
+        return
+
+    admin_username = os.getenv("TMAIL_ADMIN_USERNAME", "tony").strip() or "tony"
+    admin_password = os.getenv("TMAIL_ADMIN_PASSWORD", "").strip()
+    if not admin_password:
+        return
+
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO operators (
+            id, username, display_name, role, password_hash, is_active,
+            totp_secret, pending_totp_secret, totp_enabled, last_login_at,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "operator-tony",
+            admin_username,
+            "Tony Blum",
+            "owner",
+            hash_password(admin_password),
+            1,
+            None,
+            None,
+            0,
+            None,
+            now,
+            now,
+        ),
+    )

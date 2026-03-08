@@ -165,6 +165,8 @@ class MessageRepository:
         row = {
             "id": message_id,
             "identity_id": payload["identity_id"],
+            "template_id": payload.get("template_id"),
+            "campaign_id": payload.get("campaign_id"),
             "subject": payload["subject"],
             "preheader": payload.get("preheader", ""),
             "html_body": payload["html_body"],
@@ -185,11 +187,11 @@ class MessageRepository:
             conn.execute(
                 """
                 INSERT INTO messages (
-                    id, identity_id, subject, preheader, html_body, text_body,
+                    id, identity_id, template_id, campaign_id, subject, preheader, html_body, text_body,
                     recipients_json, status, send_mode, tracking_enabled, pixel_enabled,
                     preview, provider_message_id, error_message, created_at, updated_at, sent_at
                 ) VALUES (
-                    :id, :identity_id, :subject, :preheader, :html_body, :text_body,
+                    :id, :identity_id, :template_id, :campaign_id, :subject, :preheader, :html_body, :text_body,
                     :recipients_json, :status, :send_mode, :tracking_enabled, :pixel_enabled,
                     :preview, :provider_message_id, :error_message, :created_at, :updated_at, :sent_at
                 )
@@ -281,6 +283,8 @@ class MessageRepository:
         return {
             "id": row["id"],
             "identity_id": row["identity_id"],
+            "template_id": row["template_id"],
+            "campaign_id": row["campaign_id"],
             "identity": row["identity_email"],
             "identity_label": row["identity_label"],
             "subject": row["subject"],

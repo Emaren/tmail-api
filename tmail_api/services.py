@@ -36,6 +36,8 @@ class MailWorkflowService:
         message = self.messages.create(
             {
                 "identity_id": identity["id"],
+                "template_id": payload.get("template_id"),
+                "campaign_id": payload.get("campaign_id"),
                 "subject": payload["subject"],
                 "preheader": payload.get("preheader", ""),
                 "html_body": payload["html_body"],
