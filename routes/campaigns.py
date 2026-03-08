@@ -28,3 +28,18 @@ def get_campaign(campaign_id: str):
     if not campaign:
         return jsonify({'error': 'Campaign not found'}), 404
     return jsonify(campaign)
+
+
+@bp.route('/campaigns/<campaign_id>/launch', methods=['POST'])
+def launch_campaign(campaign_id: str):
+    try:
+        return jsonify(repo.launch(campaign_id))
+    except ValueError as exc:
+        status = 404 if str(exc) == 'Campaign not found.' else 400
+        return jsonify({'error': str(exc)}), status
+
+
+@bp.route('/campaigns/run-due', methods=['POST'])
+def run_due_campaigns():
+    limit = int((request.get_json(silent=True) or {}).get('limit') or 5)
+    return jsonify({'items': repo.run_due(limit=limit)})

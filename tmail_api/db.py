@@ -210,6 +210,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
     identity_id TEXT NOT NULL,
     template_id TEXT,
     audience_label TEXT NOT NULL,
+    audience_emails TEXT,
     send_window TEXT,
     notes TEXT,
     scheduled_for TEXT,
@@ -217,6 +218,24 @@ CREATE TABLE IF NOT EXISTS campaigns (
     updated_at TEXT NOT NULL,
     FOREIGN KEY(identity_id) REFERENCES identities(id),
     FOREIGN KEY(template_id) REFERENCES templates(id)
+);
+
+CREATE TABLE IF NOT EXISTS campaign_runs (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    message_id TEXT,
+    mode TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    recipient_count INTEGER NOT NULL DEFAULT 0,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    summary TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(campaign_id) REFERENCES campaigns(id),
+    FOREIGN KEY(message_id) REFERENCES messages(id)
 );
 """
 
@@ -364,6 +383,7 @@ def init_db() -> None:
 def run_migrations(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "messages", "template_id", "TEXT")
     ensure_column(conn, "messages", "campaign_id", "TEXT")
+    ensure_column(conn, "campaigns", "audience_emails", "TEXT")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
