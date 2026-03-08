@@ -1,3 +1,5 @@
+import sqlite3
+
 from flask import Blueprint, jsonify, request
 
 from tmail_api.repositories import SegmentRepository
@@ -17,7 +19,7 @@ def save_segment():
     payload = request.get_json(force=True) or {}
     try:
         return jsonify(repo.save(payload))
-    except ValueError as exc:
+    except (ValueError, sqlite3.IntegrityError) as exc:
         return jsonify({'error': str(exc)}), 400
 
 

@@ -617,10 +617,9 @@ class MessageRepository:
 
 
 class ContactRepository:
-    def list(self, limit: int = 120) -> list[dict[str, Any]]:
+    def list(self, limit: int | None = 120) -> list[dict[str, Any]]:
         with get_connection() as conn:
-            rows = conn.execute(
-                """
+            query = """
                 SELECT
                     contacts.*,
                     COUNT(message_contacts.id) AS message_count,
@@ -642,10 +641,11 @@ class ContactRepository:
                 LEFT JOIN message_contacts ON message_contacts.contact_id = contacts.id
                 GROUP BY contacts.id
                 ORDER BY COALESCE(last_activity_at, contacts.updated_at) DESC, contacts.email_address ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            """
+            if limit is None:
+                rows = conn.execute(query).fetchall()
+            else:
+                rows = conn.execute(f"{query} LIMIT ?", (limit,)).fetchall()
         return [self._row_to_summary(row) for row in rows]
 
     def get(self, contact_id: str) -> dict[str, Any] | None:
@@ -800,6 +800,7 @@ class ContactRepository:
 
 class SegmentRepository:
     VALID_MATCH_MODES = {"any", "all"}
+    VALID_ENGAGEMENT_FILTERS = {"any", "active", "clicked", "replied", "converted", "quiet"}
 
     def list(self, limit: int = 80) -> list[dict[str, Any]]:
         with get_connection() as conn:
@@ -829,8 +830,15 @@ class SegmentRepository:
             raise ValueError("Match mode must be 'any' or 'all'.")
 
         tags = normalize_tags(payload.get("tags") if isinstance(payload.get("tags"), list) else [])
+        company_contains = str(payload.get("company_contains") or "").strip()
+        source_filter = str(payload.get("source_filter") or "").strip().lower()
+        engagement_filter = str(payload.get("engagement_filter") or "any").strip().lower()
+        if engagement_filter not in self.VALID_ENGAGEMENT_FILTERS:
+            raise ValueError("Invalid engagement filter.")
+        if not any([tags, company_contains, source_filter, engagement_filter != "any"]):
+            raise ValueError("Add at least one segment rule: tags, company, source, or engagement.")
         if not tags:
-            raise ValueError("Add at least one tag to define the segment.")
+            tags = []
 
         segment_id = str(payload.get("id") or "")
         existing = self.get(segment_id) if segment_id else None
@@ -841,6 +849,9 @@ class SegmentRepository:
             "description": str(payload.get("description") or (existing.get("description") if existing else "") or "").strip(),
             "match_mode": match_mode,
             "tags_json": json.dumps(tags, separators=(",", ":")),
+            "company_contains": company_contains,
+            "source_filter": source_filter,
+            "engagement_filter": engagement_filter,
             "created_at": existing["created_at"] if existing else now,
             "updated_at": now,
         }
@@ -849,15 +860,22 @@ class SegmentRepository:
             conn.execute(
                 """
                 INSERT INTO segments (
-                    id, name, description, match_mode, tags_json, created_at, updated_at
+                    id, name, description, match_mode, tags_json,
+                    company_contains, source_filter, engagement_filter,
+                    created_at, updated_at
                 ) VALUES (
-                    :id, :name, :description, :match_mode, :tags_json, :created_at, :updated_at
+                    :id, :name, :description, :match_mode, :tags_json,
+                    :company_contains, :source_filter, :engagement_filter,
+                    :created_at, :updated_at
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     description = excluded.description,
                     match_mode = excluded.match_mode,
                     tags_json = excluded.tags_json,
+                    company_contains = excluded.company_contains,
+                    source_filter = excluded.source_filter,
+                    engagement_filter = excluded.engagement_filter,
                     updated_at = excluded.updated_at
                 """,
                 row,
@@ -885,6 +903,9 @@ class SegmentRepository:
             "description": row["description"] or "",
             "match_mode": row["match_mode"] or "any",
             "tags": tags,
+            "company_contains": row["company_contains"] or "",
+            "source_filter": row["source_filter"] or "",
+            "engagement_filter": row["engagement_filter"] or "any",
             "contact_count": len(all_contacts),
             "contact_emails": [contact["email_address"] for contact in contacts if contact.get("email_address")],
             "contacts_preview": [
@@ -902,26 +923,25 @@ class SegmentRepository:
 
     def _resolve_contacts(self, conn: sqlite3.Connection, row: sqlite3.Row, *, limit: int | None) -> list[dict[str, Any]]:
         tags = normalize_tags(json.loads(row["tags_json"] or "[]") if row["tags_json"] else [])
-        if not tags:
-            return []
+        company_contains = str(row["company_contains"] or "").strip().lower()
+        source_filter = str(row["source_filter"] or "").strip().lower()
+        engagement_filter = str(row["engagement_filter"] or "any").strip().lower()
 
-        contacts = conn.execute(
-            """
-            SELECT id, email_address, display_name, company, tags_json
-            FROM contacts
-            ORDER BY updated_at DESC, email_address ASC
-            """
-        ).fetchall()
+        contacts = ContactRepository().list(limit=None)
         matched: list[dict[str, Any]] = []
         for contact in contacts:
-            contact_tags = set(normalize_tags(json.loads(contact["tags_json"] or "[]") if contact["tags_json"] else []))
-            if not contact_tags:
-                continue
-            if row["match_mode"] == "all":
-                ok = all(tag in contact_tags for tag in tags)
-            else:
-                ok = any(tag in contact_tags for tag in tags)
-            if not ok:
+            contact_tags = set(normalize_tags(contact.get("tags") if isinstance(contact.get("tags"), list) else []))
+            tags_ok = True
+            if tags:
+                if row["match_mode"] == "all":
+                    tags_ok = all(tag in contact_tags for tag in tags)
+                else:
+                    tags_ok = any(tag in contact_tags for tag in tags)
+            company_ok = not company_contains or company_contains in str(contact.get("company") or "").lower()
+            source_ok = not source_filter or source_filter == str(contact.get("source") or "").lower()
+            engagement_ok = self._matches_engagement_filter(contact, engagement_filter)
+
+            if not all([tags_ok, company_ok, source_ok, engagement_ok]):
                 continue
             matched.append(
                 {
@@ -934,6 +954,27 @@ class SegmentRepository:
             if limit and len(matched) >= limit:
                 break
         return matched
+
+    def _matches_engagement_filter(self, contact: dict[str, Any], engagement_filter: str) -> bool:
+        if engagement_filter == "any":
+            return True
+
+        conversion_count = int(contact.get("conversion_count") or 0)
+        reply_count = int(contact.get("reply_count") or 0)
+        click_count = int(contact.get("click_count") or 0)
+        open_count = int(contact.get("open_count") or 0)
+
+        if engagement_filter == "converted":
+            return conversion_count > 0
+        if engagement_filter == "replied":
+            return reply_count > 0
+        if engagement_filter == "clicked":
+            return click_count > 0
+        if engagement_filter == "active":
+            return any([conversion_count > 0, reply_count > 0, click_count > 0, open_count > 0])
+        if engagement_filter == "quiet":
+            return not any([conversion_count > 0, reply_count > 0, click_count > 0, open_count > 0])
+        return True
 
 
 class TemplateRepository:

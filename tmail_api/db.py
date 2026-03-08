@@ -90,6 +90,9 @@ CREATE TABLE IF NOT EXISTS segments (
     description TEXT,
     match_mode TEXT NOT NULL DEFAULT 'any',
     tags_json TEXT NOT NULL DEFAULT '[]',
+    company_contains TEXT,
+    source_filter TEXT,
+    engagement_filter TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -416,6 +419,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "campaigns", "audience_emails", "TEXT")
     ensure_column(conn, "campaigns", "audience_source", "TEXT DEFAULT 'manual'")
     ensure_column(conn, "campaigns", "segment_id", "TEXT")
+    ensure_column(conn, "segments", "company_contains", "TEXT")
+    ensure_column(conn, "segments", "source_filter", "TEXT")
+    ensure_column(conn, "segments", "engagement_filter", "TEXT")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
