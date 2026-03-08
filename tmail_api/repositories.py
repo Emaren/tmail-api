@@ -6,7 +6,7 @@ import re
 import sqlite3
 from typing import Any
 
-from tmail_api.db import get_connection, make_id, utc_now
+from tmail_api.db import ensure_contact_row, get_connection, make_id, utc_now
 
 
 def slugify(value: str) -> str:
@@ -143,6 +143,16 @@ class MessageRepository:
                 "SELECT token, url, label, created_at FROM tracked_links WHERE message_id = ? ORDER BY created_at ASC",
                 (message_id,),
             ).fetchall()
+            contacts = conn.execute(
+                """
+                SELECT message_contacts.*, contacts.display_name, contacts.company, contacts.tags_json, contacts.notes AS contact_notes
+                FROM message_contacts
+                JOIN contacts ON contacts.id = message_contacts.contact_id
+                WHERE message_contacts.message_id = ?
+                ORDER BY message_contacts.email_address ASC
+                """,
+                (message_id,),
+            ).fetchall()
             detail = self._row_to_summary(row, conn=conn)
         detail["html_body"] = row["html_body"]
         detail["text_body"] = row["text_body"]
@@ -157,6 +167,7 @@ class MessageRepository:
             for event in events
         ]
         detail["tracked_links"] = [dict(link) for link in links]
+        detail["contacts"] = [self._message_contact_to_dict(contact) for contact in contacts]
         return detail
 
     def create(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -198,6 +209,14 @@ class MessageRepository:
                 """,
                 row,
             )
+            self._link_contacts(
+                conn,
+                message_id=message_id,
+                recipients=payload.get("recipients", []),
+                status=row["status"],
+                sent_at=row["sent_at"],
+                created_at=now,
+            )
         return self.get(message_id)  # type: ignore[return-value]
 
     def update_status(
@@ -238,6 +257,7 @@ class MessageRepository:
                 "INSERT INTO events (id, message_id, event_type, occurred_at, payload_json) VALUES (?, ?, ?, ?, ?)",
                 (event_id, message_id, event_type, occurred_at, json.dumps(payload)),
             )
+            self._apply_event_to_message_contacts(conn, message_id, event_type, payload, occurred_at)
         return {
             "id": event_id,
             "message_id": message_id,
@@ -245,6 +265,40 @@ class MessageRepository:
             "occurred_at": occurred_at,
             "payload": payload,
         }
+
+    def record_outcome(self, message_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        outcome = str(payload.get("outcome") or "").strip()
+        note = str(payload.get("note") or "").strip()
+        actor = str(payload.get("actor") or "operator").strip() or "operator"
+        if not outcome:
+            raise ValueError("Outcome is required.")
+        if not self.get(message_id):
+            raise ValueError("Message not found")
+
+        event_map = {
+            "reply_positive": ("replied_manual", {"reply_state": "positive"}),
+            "reply_neutral": ("replied_manual", {"reply_state": "neutral"}),
+            "reply_objection": ("replied_manual", {"reply_state": "objection"}),
+            "meeting_booked": ("meeting_booked", {"conversion_state": "meeting_booked"}),
+            "converted": ("converted", {"conversion_state": "converted"}),
+            "dead_thread": ("dead_thread", {"engagement_status": "dead_thread"}),
+        }
+        if outcome not in event_map:
+            raise ValueError("Invalid outcome.")
+
+        with get_connection() as conn:
+            target = self._resolve_target_contact(conn, message_id, payload)
+
+        event_type, extra = event_map[outcome]
+        event_payload = {
+            **extra,
+            "actor": actor,
+            "note": note or None,
+            "contact_id": target["contact_id"],
+            "contact_email": target["email_address"],
+        }
+        self.add_event(message_id, event_type, event_payload)
+        return self.get(message_id)  # type: ignore[return-value]
 
     def create_tracked_link(self, message_id: str, url: str, label: str | None = None) -> str:
         token = make_id("lnk")
@@ -275,6 +329,7 @@ class MessageRepository:
             "opens": counts.get("opened", 0),
             "clicks": counts.get("clicked", 0),
             "replies": counts.get("replied", 0) + counts.get("replied_manual", 0),
+            "conversions": counts.get("meeting_booked", 0) + counts.get("converted", 0),
         }
 
     def _row_to_summary(self, row: sqlite3.Row, *, conn: sqlite3.Connection) -> dict[str, Any]:
@@ -296,6 +351,7 @@ class MessageRepository:
             "opens": counts["opens"],
             "clicks": counts["clicks"],
             "replies": counts["replies"],
+            "conversions": counts["conversions"],
             "tracking_enabled": bool(row["tracking_enabled"]),
             "pixel_enabled": bool(row["pixel_enabled"]),
             "provider_message_id": row["provider_message_id"],
@@ -303,6 +359,433 @@ class MessageRepository:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "sent_at": row["sent_at"],
+        }
+
+    def _link_contacts(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        message_id: str,
+        recipients: list[Any],
+        status: str,
+        sent_at: str | None,
+        created_at: str,
+    ) -> None:
+        normalized_recipients: list[str] = []
+        for recipient in recipients:
+            normalized = str(recipient).strip().lower()
+            if normalized and normalized not in normalized_recipients:
+                normalized_recipients.append(normalized)
+
+        if not normalized_recipients:
+            return
+
+        delivery_status = "sent" if status == "Sent" or sent_at else "draft"
+        engagement_status = "sent" if delivery_status == "sent" else "draft"
+
+        for email_address in normalized_recipients:
+            contact_id, stored_email = ensure_contact_row(conn, email_address)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO message_contacts (
+                    id, message_id, contact_id, email_address, delivery_status,
+                    inferred_open_count, inferred_click_count, reply_state,
+                    conversion_state, engagement_status, notes, sent_at,
+                    last_opened_at, last_clicked_at, last_replied_at,
+                    last_converted_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    make_id("msgcontact"),
+                    message_id,
+                    contact_id,
+                    stored_email,
+                    delivery_status,
+                    0,
+                    0,
+                    "",
+                    "",
+                    engagement_status,
+                    "",
+                    sent_at,
+                    None,
+                    None,
+                    None,
+                    None,
+                    created_at,
+                    created_at,
+                ),
+            )
+
+    def _list_message_contacts(self, conn: sqlite3.Connection, message_id: str) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT * FROM message_contacts
+            WHERE message_id = ?
+            ORDER BY email_address ASC
+            """,
+            (message_id,),
+        ).fetchall()
+
+    def _resolve_target_contact(self, conn: sqlite3.Connection, message_id: str, payload: dict[str, Any]) -> sqlite3.Row:
+        contacts = self._list_message_contacts(conn, message_id)
+        if not contacts:
+            raise ValueError("No contact record is linked to this message.")
+
+        contact_id = str(payload.get("contact_id") or "").strip()
+        contact_email = str(payload.get("contact_email") or "").strip().lower()
+        if contact_id:
+            for contact in contacts:
+                if contact["contact_id"] == contact_id:
+                    return contact
+            raise ValueError("Selected contact is not linked to this message.")
+        if contact_email:
+            for contact in contacts:
+                if contact["email_address"] == contact_email:
+                    return contact
+            raise ValueError("Selected contact email is not linked to this message.")
+        if len(contacts) == 1:
+            return contacts[0]
+        raise ValueError("Select a recipient contact before marking manual engagement on a multi-recipient message.")
+
+    def _apply_event_to_message_contacts(
+        self,
+        conn: sqlite3.Connection,
+        message_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        occurred_at: str,
+    ) -> None:
+        contacts = self._list_message_contacts(conn, message_id)
+        if not contacts:
+            return
+
+        if event_type == "sent":
+            conn.execute(
+                """
+                UPDATE message_contacts
+                SET delivery_status = 'sent',
+                    sent_at = COALESCE(sent_at, ?),
+                    engagement_status = CASE
+                        WHEN COALESCE(engagement_status, '') IN ('', 'draft') THEN 'sent'
+                        ELSE engagement_status
+                    END,
+                    updated_at = ?
+                WHERE message_id = ?
+                """,
+                (occurred_at, occurred_at, message_id),
+            )
+            return
+
+        if event_type in {"opened", "clicked"} and len(contacts) != 1:
+            return
+
+        if event_type == "opened":
+            target = contacts[0]
+            conn.execute(
+                """
+                UPDATE message_contacts
+                SET inferred_open_count = inferred_open_count + 1,
+                    last_opened_at = ?,
+                    engagement_status = CASE
+                        WHEN COALESCE(engagement_status, '') IN ('draft', 'sent', 'opened', '') THEN 'opened'
+                        ELSE engagement_status
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (occurred_at, occurred_at, target["id"]),
+            )
+            return
+
+        if event_type == "clicked":
+            target = contacts[0]
+            conn.execute(
+                """
+                UPDATE message_contacts
+                SET inferred_click_count = inferred_click_count + 1,
+                    last_clicked_at = ?,
+                    engagement_status = CASE
+                        WHEN COALESCE(engagement_status, '') IN ('draft', 'sent', 'opened', 'clicked', '') THEN 'clicked'
+                        ELSE engagement_status
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (occurred_at, occurred_at, target["id"]),
+            )
+            return
+
+        if event_type in {"replied_manual", "meeting_booked", "converted", "dead_thread"}:
+            target = self._resolve_target_contact(conn, message_id, payload)
+            note = str(payload.get("note") or "").strip()
+
+            if event_type == "replied_manual":
+                reply_state = str(payload.get("reply_state") or "manual").strip() or "manual"
+                conn.execute(
+                    """
+                    UPDATE message_contacts
+                    SET reply_state = ?,
+                        last_replied_at = ?,
+                        engagement_status = CASE
+                            WHEN COALESCE(conversion_state, '') != '' THEN engagement_status
+                            ELSE ?
+                        END,
+                        notes = CASE WHEN ? != '' THEN ? ELSE notes END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (reply_state, occurred_at, f"reply_{reply_state}", note, note, occurred_at, target["id"]),
+                )
+                return
+
+            if event_type == "meeting_booked":
+                conn.execute(
+                    """
+                    UPDATE message_contacts
+                    SET conversion_state = 'meeting_booked',
+                        last_converted_at = ?,
+                        engagement_status = 'meeting_booked',
+                        notes = CASE WHEN ? != '' THEN ? ELSE notes END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (occurred_at, note, note, occurred_at, target["id"]),
+                )
+                return
+
+            if event_type == "converted":
+                conn.execute(
+                    """
+                    UPDATE message_contacts
+                    SET conversion_state = 'converted',
+                        last_converted_at = ?,
+                        engagement_status = 'converted',
+                        notes = CASE WHEN ? != '' THEN ? ELSE notes END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (occurred_at, note, note, occurred_at, target["id"]),
+                )
+                return
+
+            if event_type == "dead_thread":
+                conn.execute(
+                    """
+                    UPDATE message_contacts
+                    SET engagement_status = 'dead_thread',
+                        notes = CASE WHEN ? != '' THEN ? ELSE notes END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (note, note, occurred_at, target["id"]),
+                )
+
+    def _message_contact_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        tags = json.loads(row["tags_json"] or "[]") if row["tags_json"] else []
+        return {
+            "id": row["id"],
+            "contact_id": row["contact_id"],
+            "email_address": row["email_address"],
+            "display_name": row["display_name"] or "",
+            "company": row["company"] or "",
+            "tags": tags if isinstance(tags, list) else [],
+            "contact_notes": row["contact_notes"] or "",
+            "delivery_status": row["delivery_status"],
+            "inferred_open_count": row["inferred_open_count"],
+            "inferred_click_count": row["inferred_click_count"],
+            "reply_state": row["reply_state"] or "",
+            "conversion_state": row["conversion_state"] or "",
+            "engagement_status": row["engagement_status"] or "",
+            "notes": row["notes"] or "",
+            "sent_at": row["sent_at"],
+            "last_opened_at": row["last_opened_at"],
+            "last_clicked_at": row["last_clicked_at"],
+            "last_replied_at": row["last_replied_at"],
+            "last_converted_at": row["last_converted_at"],
+            "updated_at": row["updated_at"],
+        }
+
+
+class ContactRepository:
+    def list(self, limit: int = 120) -> list[dict[str, Any]]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    contacts.*,
+                    COUNT(message_contacts.id) AS message_count,
+                    SUM(CASE WHEN message_contacts.delivery_status = 'sent' THEN 1 ELSE 0 END) AS sent_count,
+                    SUM(COALESCE(message_contacts.inferred_open_count, 0)) AS open_count,
+                    SUM(COALESCE(message_contacts.inferred_click_count, 0)) AS click_count,
+                    SUM(CASE WHEN COALESCE(message_contacts.reply_state, '') != '' THEN 1 ELSE 0 END) AS reply_count,
+                    SUM(CASE WHEN COALESCE(message_contacts.conversion_state, '') != '' THEN 1 ELSE 0 END) AS conversion_count,
+                    MAX(COALESCE(
+                        message_contacts.last_converted_at,
+                        message_contacts.last_replied_at,
+                        message_contacts.last_clicked_at,
+                        message_contacts.last_opened_at,
+                        message_contacts.sent_at,
+                        message_contacts.updated_at,
+                        contacts.updated_at
+                    )) AS last_activity_at
+                FROM contacts
+                LEFT JOIN message_contacts ON message_contacts.contact_id = contacts.id
+                GROUP BY contacts.id
+                ORDER BY COALESCE(last_activity_at, contacts.updated_at) DESC, contacts.email_address ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_summary(row) for row in rows]
+
+    def get(self, contact_id: str) -> dict[str, Any] | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    contacts.*,
+                    COUNT(message_contacts.id) AS message_count,
+                    SUM(CASE WHEN message_contacts.delivery_status = 'sent' THEN 1 ELSE 0 END) AS sent_count,
+                    SUM(COALESCE(message_contacts.inferred_open_count, 0)) AS open_count,
+                    SUM(COALESCE(message_contacts.inferred_click_count, 0)) AS click_count,
+                    SUM(CASE WHEN COALESCE(message_contacts.reply_state, '') != '' THEN 1 ELSE 0 END) AS reply_count,
+                    SUM(CASE WHEN COALESCE(message_contacts.conversion_state, '') != '' THEN 1 ELSE 0 END) AS conversion_count,
+                    MAX(COALESCE(
+                        message_contacts.last_converted_at,
+                        message_contacts.last_replied_at,
+                        message_contacts.last_clicked_at,
+                        message_contacts.last_opened_at,
+                        message_contacts.sent_at,
+                        message_contacts.updated_at,
+                        contacts.updated_at
+                    )) AS last_activity_at
+                FROM contacts
+                LEFT JOIN message_contacts ON message_contacts.contact_id = contacts.id
+                WHERE contacts.id = ?
+                GROUP BY contacts.id
+                """,
+                (contact_id,),
+            ).fetchone()
+            if not row:
+                return None
+            detail = self._row_to_summary(row)
+            history_rows = conn.execute(
+                """
+                SELECT
+                    message_contacts.*,
+                    messages.subject,
+                    messages.status,
+                    messages.send_mode,
+                    messages.sent_at AS message_sent_at
+                FROM message_contacts
+                JOIN messages ON messages.id = message_contacts.message_id
+                WHERE message_contacts.contact_id = ?
+                ORDER BY COALESCE(message_contacts.last_converted_at, message_contacts.last_replied_at,
+                                  message_contacts.last_clicked_at, message_contacts.last_opened_at,
+                                  message_contacts.sent_at, message_contacts.updated_at) DESC
+                LIMIT 12
+                """,
+                (contact_id,),
+            ).fetchall()
+        detail["history"] = [
+            {
+                "message_id": history["message_id"],
+                "subject": history["subject"],
+                "status": history["status"],
+                "send_mode": history["send_mode"],
+                "delivery_status": history["delivery_status"],
+                "inferred_open_count": history["inferred_open_count"],
+                "inferred_click_count": history["inferred_click_count"],
+                "reply_state": history["reply_state"] or "",
+                "conversion_state": history["conversion_state"] or "",
+                "engagement_status": history["engagement_status"] or "",
+                "sent_at": history["message_sent_at"] or history["sent_at"],
+                "updated_at": history["updated_at"],
+            }
+            for history in history_rows
+        ]
+        return detail
+
+    def save(self, payload: dict[str, Any]) -> dict[str, Any]:
+        email_address = str(payload.get("email_address") or "").strip().lower()
+        if not email_address:
+            raise ValueError("Email address is required.")
+
+        contact_id = str(payload.get("id") or "")
+        existing = self.get(contact_id) if contact_id else None
+        now = utc_now()
+        existing_display_name = existing.get("display_name") if existing else ""
+        existing_company = existing.get("company") if existing else ""
+        existing_source = existing.get("source") if existing else "manual"
+        existing_notes = existing.get("notes") if existing else ""
+        tags = payload.get("tags") if isinstance(payload.get("tags"), list) else (existing.get("tags") if existing else [])
+        row = {
+            "id": contact_id or make_id("contact"),
+            "email_address": email_address,
+            "display_name": str(payload.get("display_name") or existing_display_name).strip(),
+            "company": str(payload.get("company") or existing_company).strip(),
+            "tags_json": json.dumps(tags if isinstance(tags, list) else []),
+            "source": str(payload.get("source") or existing_source).strip(),
+            "notes": str(payload.get("notes") or existing_notes).strip(),
+            "created_at": existing["created_at"] if existing else now,
+            "updated_at": now,
+        }
+        with get_connection() as conn:
+            row_with_default = conn.execute(
+                "SELECT id, created_at FROM contacts WHERE email_address = ?",
+                (email_address,),
+            ).fetchone()
+            if row_with_default and not contact_id:
+                row["id"] = row_with_default["id"]
+                row["created_at"] = row_with_default["created_at"]
+            conn.execute(
+                """
+                INSERT INTO contacts (
+                    id, email_address, display_name, company, tags_json,
+                    source, notes, created_at, updated_at
+                ) VALUES (
+                    :id, :email_address, :display_name, :company, :tags_json,
+                    :source, :notes, :created_at, :updated_at
+                )
+                ON CONFLICT(id) DO UPDATE SET
+                    email_address = excluded.email_address,
+                    display_name = excluded.display_name,
+                    company = excluded.company,
+                    tags_json = excluded.tags_json,
+                    source = excluded.source,
+                    notes = excluded.notes,
+                    updated_at = excluded.updated_at
+                """,
+                row,
+            )
+        return self.get(row["id"])  # type: ignore[return-value]
+
+    def _row_to_summary(self, row: sqlite3.Row) -> dict[str, Any]:
+        tags = json.loads(row["tags_json"] or "[]") if row["tags_json"] else []
+        click_count = int(row["click_count"] or 0)
+        reply_count = int(row["reply_count"] or 0)
+        conversion_count = int(row["conversion_count"] or 0)
+        open_count = int(row["open_count"] or 0)
+        engagement_score = (conversion_count * 12) + (reply_count * 8) + (click_count * 4) + open_count
+        return {
+            "id": row["id"],
+            "email_address": row["email_address"],
+            "display_name": row["display_name"] or "",
+            "company": row["company"] or "",
+            "tags": tags if isinstance(tags, list) else [],
+            "source": row["source"] or "",
+            "notes": row["notes"] or "",
+            "message_count": int(row["message_count"] or 0),
+            "sent_count": int(row["sent_count"] or 0),
+            "open_count": open_count,
+            "click_count": click_count,
+            "reply_count": reply_count,
+            "conversion_count": conversion_count,
+            "engagement_score": engagement_score,
+            "last_activity_at": row["last_activity_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
         }
 
 

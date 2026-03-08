@@ -160,12 +160,41 @@ def build_analytics_summary() -> dict[str, Any]:
             '''
         ).fetchall()
 
-    identity_message_map = {row['identity_id']: row for row in identity_message_rows}
+        contact_count_row = conn.execute(
+            "SELECT COUNT(*) AS total FROM contacts"
+        ).fetchone()
+
+        top_contact_rows = conn.execute(
+            '''
+            SELECT
+                contacts.id,
+                contacts.email_address,
+                contacts.display_name,
+                COUNT(message_contacts.id) AS message_count,
+                SUM(CASE WHEN message_contacts.delivery_status = 'sent' THEN 1 ELSE 0 END) AS sent_count,
+                SUM(COALESCE(message_contacts.inferred_open_count, 0)) AS open_count,
+                SUM(COALESCE(message_contacts.inferred_click_count, 0)) AS click_count,
+                SUM(CASE WHEN COALESCE(message_contacts.reply_state, '') != '' THEN 1 ELSE 0 END) AS reply_count,
+                SUM(CASE WHEN COALESCE(message_contacts.conversion_state, '') != '' THEN 1 ELSE 0 END) AS conversion_count
+            FROM contacts
+            LEFT JOIN message_contacts ON message_contacts.contact_id = contacts.id
+            GROUP BY contacts.id
+            ORDER BY (
+                SUM(CASE WHEN COALESCE(message_contacts.conversion_state, '') != '' THEN 1 ELSE 0 END) * 12 +
+                SUM(CASE WHEN COALESCE(message_contacts.reply_state, '') != '' THEN 1 ELSE 0 END) * 8 +
+                SUM(COALESCE(message_contacts.inferred_click_count, 0)) * 4 +
+                SUM(COALESCE(message_contacts.inferred_open_count, 0))
+            ) DESC, contacts.email_address ASC
+            LIMIT 8
+            '''
+        ).fetchall()
+
+    identity_message_map = {row['identity_id']: dict(row) for row in identity_message_rows}
     identity_event_map: dict[str, dict[str, int]] = {}
     for row in identity_event_rows:
         identity_event_map.setdefault(row['identity_id'], {})[row['event_type']] = row['total']
 
-    template_message_map = {row['template_id']: row for row in template_message_rows}
+    template_message_map = {row['template_id']: dict(row) for row in template_message_rows}
     template_event_map: dict[str, dict[str, int]] = {}
     for row in template_event_rows:
         template_event_map.setdefault(row['template_id'], {})[row['event_type']] = row['total']
@@ -215,9 +244,11 @@ def build_analytics_summary() -> dict[str, Any]:
             'sent_messages': int(overview_row['sent_messages'] or 0),
             'draft_messages': int(overview_row['draft_messages'] or 0),
             'review_messages': int(overview_row['review_messages'] or 0),
+            'contacts_count': int(contact_count_row['total'] or 0),
             'open_events': int(event_counts.get('opened', 0)),
             'click_events': int(event_counts.get('clicked', 0)),
             'reply_events': int(event_counts.get('replied', 0)) + int(event_counts.get('replied_manual', 0)),
+            'conversion_events': int(event_counts.get('meeting_booked', 0)) + int(event_counts.get('converted', 0)),
             'seed_average_score': round(sum(int(row['overall_score'] or 0) for row in seed_rows) / len(seed_rows)) if seed_rows else 0,
             'active_campaigns': len([row for row in campaign_rows if row['status'] in {'ready', 'scheduled', 'live'}]),
         },
@@ -225,4 +256,5 @@ def build_analytics_summary() -> dict[str, Any]:
         'template_performance': template_performance,
         'seed_runs': [dict(row) for row in seed_rows],
         'campaigns': [dict(row) for row in campaign_rows],
+        'top_contacts': [dict(row) for row in top_contact_rows],
     }

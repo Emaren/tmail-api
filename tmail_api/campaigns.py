@@ -136,6 +136,7 @@ class CampaignRepository:
             'open_events': counts_by_type.get('opened', 0),
             'click_events': counts_by_type.get('clicked', 0),
             'reply_events': counts_by_type.get('replied', 0) + counts_by_type.get('replied_manual', 0),
+            'conversion_events': counts_by_type.get('meeting_booked', 0) + counts_by_type.get('converted', 0),
             'created_at': row['created_at'],
             'updated_at': row['updated_at'],
         }

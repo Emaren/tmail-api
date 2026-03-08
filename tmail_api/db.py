@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -71,6 +72,18 @@ CREATE TABLE IF NOT EXISTS operators (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS contacts (
+    id TEXT PRIMARY KEY,
+    email_address TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    company TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    source TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL,
@@ -87,6 +100,30 @@ CREATE TABLE IF NOT EXISTS tracked_links (
     label TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY(message_id) REFERENCES messages(id)
+);
+
+CREATE TABLE IF NOT EXISTS message_contacts (
+    id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    contact_id TEXT NOT NULL,
+    email_address TEXT NOT NULL,
+    delivery_status TEXT NOT NULL DEFAULT 'draft',
+    inferred_open_count INTEGER NOT NULL DEFAULT 0,
+    inferred_click_count INTEGER NOT NULL DEFAULT 0,
+    reply_state TEXT,
+    conversion_state TEXT,
+    engagement_status TEXT,
+    notes TEXT,
+    sent_at TEXT,
+    last_opened_at TEXT,
+    last_clicked_at TEXT,
+    last_replied_at TEXT,
+    last_converted_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(message_id, contact_id),
+    FOREIGN KEY(message_id) REFERENCES messages(id),
+    FOREIGN KEY(contact_id) REFERENCES contacts(id)
 );
 
 CREATE TABLE IF NOT EXISTS templates (
@@ -320,6 +357,7 @@ def init_db() -> None:
         seed_missing_template_versions(conn)
         seed_default_seed_inboxes(conn)
         seed_default_operator(conn)
+        seed_missing_message_contacts(conn)
 
 
 def run_migrations(conn: sqlite3.Connection) -> None:
@@ -512,3 +550,129 @@ def seed_default_operator(conn: sqlite3.Connection) -> None:
             now,
         ),
     )
+
+
+def ensure_contact_row(conn: sqlite3.Connection, email_address: str, *, source: str = "message_recipient") -> tuple[str, str]:
+    normalized = email_address.strip().lower()
+    if not normalized:
+        raise ValueError("Contact email is required")
+
+    row = conn.execute(
+        "SELECT id, email_address FROM contacts WHERE email_address = ?",
+        (normalized,),
+    ).fetchone()
+    if row:
+        return row["id"], row["email_address"]
+
+    contact_id = make_id("contact")
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO contacts (
+            id, email_address, display_name, company, tags_json,
+            source, notes, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (contact_id, normalized, "", "", "[]", source, "", now, now),
+    )
+    return contact_id, normalized
+
+
+def seed_missing_message_contacts(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id, recipients_json, status, created_at, sent_at FROM messages ORDER BY created_at ASC"
+    ).fetchall()
+
+    for row in rows:
+        exists = conn.execute(
+            "SELECT 1 FROM message_contacts WHERE message_id = ? LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if exists:
+            continue
+
+        try:
+            recipients = json.loads(row["recipients_json"] or "[]")
+        except json.JSONDecodeError:
+            recipients = []
+
+        normalized_recipients: list[str] = []
+        for recipient in recipients:
+            normalized = str(recipient).strip().lower()
+            if normalized and normalized not in normalized_recipients:
+                normalized_recipients.append(normalized)
+
+        if not normalized_recipients:
+            continue
+
+        inferred_open_count = 0
+        inferred_click_count = 0
+        last_opened_at = None
+        last_clicked_at = None
+        if len(normalized_recipients) == 1:
+            open_row = conn.execute(
+                """
+                SELECT COUNT(*) AS total, MAX(occurred_at) AS last_at
+                FROM events
+                WHERE message_id = ? AND event_type = 'opened'
+                """,
+                (row["id"],),
+            ).fetchone()
+            click_row = conn.execute(
+                """
+                SELECT COUNT(*) AS total, MAX(occurred_at) AS last_at
+                FROM events
+                WHERE message_id = ? AND event_type = 'clicked'
+                """,
+                (row["id"],),
+            ).fetchone()
+            inferred_open_count = int(open_row["total"] or 0)
+            inferred_click_count = int(click_row["total"] or 0)
+            last_opened_at = open_row["last_at"]
+            last_clicked_at = click_row["last_at"]
+
+        delivery_status = "sent" if row["status"] == "Sent" or row["sent_at"] else "draft"
+        engagement_status = (
+            "clicked"
+            if inferred_click_count
+            else "opened"
+            if inferred_open_count
+            else "sent"
+            if delivery_status == "sent"
+            else "draft"
+        )
+
+        for email_address in normalized_recipients:
+            contact_id, stored_email = ensure_contact_row(conn, email_address)
+            now = utc_now()
+            conn.execute(
+                """
+                INSERT INTO message_contacts (
+                    id, message_id, contact_id, email_address, delivery_status,
+                    inferred_open_count, inferred_click_count, reply_state,
+                    conversion_state, engagement_status, notes, sent_at,
+                    last_opened_at, last_clicked_at, last_replied_at,
+                    last_converted_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    make_id("msgcontact"),
+                    row["id"],
+                    contact_id,
+                    stored_email,
+                    delivery_status,
+                    inferred_open_count if len(normalized_recipients) == 1 else 0,
+                    inferred_click_count if len(normalized_recipients) == 1 else 0,
+                    "",
+                    "",
+                    engagement_status,
+                    "",
+                    row["sent_at"],
+                    last_opened_at if len(normalized_recipients) == 1 else None,
+                    last_clicked_at if len(normalized_recipients) == 1 else None,
+                    None,
+                    None,
+                    row["created_at"],
+                    now,
+                ),
+            )

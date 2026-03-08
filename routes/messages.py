@@ -30,3 +30,16 @@ def get_message(message_id: str):
     if not message:
         return jsonify({"error": "Message not found"}), 404
     return jsonify(message)
+
+
+@bp.route("/messages/<message_id>/outcome", methods=["POST"])
+def record_message_outcome(message_id: str):
+    payload = request.get_json(force=True) or {}
+    try:
+        result = repo.record_outcome(message_id, payload)
+    except ValueError as exc:
+        status = 404 if str(exc) == "Message not found" else 400
+        return jsonify({"error": str(exc)}), status
+    if not result:
+        return jsonify({"error": "Message not found"}), 404
+    return jsonify(result)
