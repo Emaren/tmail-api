@@ -11,3 +11,5 @@ pull-all
 doctor
 
 .venv/
+
+tmail.db
